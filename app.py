@@ -1,11 +1,12 @@
-# app.py — Streamlined Binance USDT-M Perps Breakout Bot (FIXED)
-# ✅ Core: Breakout + body, Quick Retest, Sweep/Reclaim (with body), HTF(15m) bias gating 5m (corrected)
-# ✅ Flow: CVD slope, Liquidity wall avoidance (per-side median from snapshot), Volume Z-score (quote vol only)
-# ✅ OI (eased): last-step slope alignment + (z OR Δ%), strong z bypasses direction
-# ✅ Risk: R:R=1:2 (TP1, TP2), trailing stop ONLY after TP1
-# ✅ Ops: 4h cooldown after trade, Daily stats 22:00 Riyadh, /healthz, Telegram alerts
-# ✅ Diagnostics: drop reasons exposed in /healthz (optional logs), safe by default
-# ❌ Removed clutter: spread cap, macro ATR pause, BTC/ETH beta, redundant filters
+# app.py — Binance USDT-M Scalper with Optional Consensus Router
+# ✅ Core: Breakout + body, Quick Retest, Sweep/Reclaim(with body), HTF(15m) bias gating 5m (fixed)
+# ✅ Flow: CVD slope, Liquidity wall avoidance (per-side snapshot), Volume Z on QUOTE vol (fixed)
+# ✅ OI (fixed): last-step slope + (z OR Δ%), strong z bypass direction
+# ✅ Risk: R:R=1:2 (TP1, TP2), TRAIL only after TP1
+# ✅ Ops: 4h cooldown, Daily stats (22:00 Riyadh), /healthz, Telegram
+# ✅ Diagnostics: drop reasons in /healthz (sampled logs)
+# 🆕 OPTIONAL: Consensus Router (BR + RSI + PMM + Grid) with quality gates, sizing boosters, fee-aware exits, vetoes
+#     Toggle with CONSENSUS_ROUTER=true (no code changes needed)
 
 import sys, subprocess, os
 def _ensure(pkgs):
@@ -50,21 +51,21 @@ class Settings(BaseSettings):
     RECLAIM_BUFFER_BP: int = 6
     RECLAIM_BODY_RATIO_MIN: float = 0.55
     HTF_SMA_LEN: int = 50
-    WICK_SIDE_MAX: float = 0.40          # eased slightly for alts
+    WICK_SIDE_MAX: float = 0.40
 
-    # Volume (Z-score on QUOTE volume only)
+    # Volume (Z-score on QUOTE)
     VOL_Z_MIN: float = 1.5
 
     # OI (eased): last-step slope + (z OR delta), strong z bypasses direction
     OI_LOOKBACK: str = "5m"
     OI_Z_MIN: float = 1.0
-    OI_DELTA_MIN: float = 0.005          # 0.5%
+    OI_DELTA_MIN: float = 0.005
 
     # CVD (aggTrade) confirmation
     ENABLE_CVD: bool = True
     CVD_WINDOW_SEC: int = 300
-    CVD_REQUIRE_SIGN: bool = True        # longs need positive, shorts negative
-    CVD_MIN_SLOPE_ABS: float = 0.0001    # allow near-flat
+    CVD_REQUIRE_SIGN: bool = True
+    CVD_MIN_SLOPE_ABS: float = 0.0001
 
     # Liquidity walls (depth5)
     ENABLE_WALLS: bool = True
@@ -99,6 +100,34 @@ class Settings(BaseSettings):
     HOST: str = "0.0.0.0"
     PORT: int = int(os.getenv("PORT", "8080"))
     TZ: str = "Asia/Riyadh"
+
+    # ---------- Consensus Router knobs (optional) ----------
+    CONSENSUS_ROUTER: bool = False       # turn on via env to use router
+    # Quality gates
+    SPREAD_BPS_MAX: float = 8.0
+    ATR1M_MIN_BPS: float = 5.0
+    ATR1M_MAX_BPS: float = 80.0
+    # RSI
+    RSI_LEN: int = 14
+    RSI_HIGH: float = 60.0
+    RSI_LOW: float = 40.0
+    CONS_MIN: float = 0.60
+    # Sizing boosters
+    PMM_IMB_GREEN: float = 0.60         # bid share for longs; (1-imb) for shorts
+    PMM_SIZE_BOOST: float = 0.20
+    GRID_STEP_BP: float = 25.0
+    GRID_SIZE_BOOST: float = 0.10
+    MAX_ORDER_VALUE_USDT: Optional[float] = None
+    # Exits (fee-aware-ish)
+    SL_BPS: float = 12.0                # beyond retest level
+    TP1_BPS: float = 30.0               # +25~35 bps
+    TRAIL_ATR1M_MULT: float = 1.2
+    TIME_STOP_SEC_MIN: int = 180
+    TIME_STOP_SEC_MAX: int = 480
+    # Vetoes
+    MAX_CONSEC_LOSSES: int = 6
+    DAILY_DD_HALT_PCT: float = 5.0      # (uses R-based proxy)
+    TOXIC_IMB_THRESH: float = 0.70
 
     model_config = SettingsConfigDict(env_file=".env", case_sensitive=False)
     @field_validator("SYMBOLS", mode="before")
@@ -148,6 +177,24 @@ def atr(highs: List[float], lows: List[float], closes: List[float], length: int)
         trs.append(max(highs[i]-lows[i], abs(highs[i]-closes[i-1]), abs(lows[i]-closes[i-1])))
     if len(trs) < length: return None
     return sum(trs[-length:]) / length
+
+def rsi(closes: List[float], length:int=14)->Optional[float]:
+    if len(closes) < length+1: return None
+    gains=0.0; losses=0.0
+    for i in range(-length,0):
+        diff=closes[i]-closes[i-1]
+        if diff>=0: gains+=diff
+        else: losses-=diff
+    avg_gain=gains/length; avg_loss=losses/length
+    if avg_loss==0: return 100.0
+    rs=avg_gain/avg_loss
+    return 100.0 - (100.0/(1.0+rs))
+
+def bps(x: float) -> float: return x*10_000.0
+def from_bps(bps_val: float, price: float, side: str, sign: int) -> float:
+    delta = price * (bps_val/10_000.0)
+    return price + sign*delta
+
 def _fmt_pct(a: float, b: float) -> float:
     if b == 0: return 0.0
     return (a/b - 1.0) * 100.0
@@ -204,7 +251,7 @@ class BinanceClient:
             d=await r.json()
             return float(d.get("openInterest", 0))
 
-# Streams per chunk: kline(5m/15m) + bookTicker + aggTrade + depth5
+# Streams per chunk: kline(1m/5m/15m) + bookTicker + aggTrade + depth5
 class WSStream:
     def __init__(self, symbols: List[str], timeframes: List[str], on_kline, on_bookticker, on_aggtrade, on_depth):
         self.symbols=[s.lower() for s in symbols]; self.timeframes=timeframes
@@ -360,12 +407,8 @@ class BreakoutEngine:
         br=body_ratio(o[-1],h[-1],l[-1],c[-1])
         pad=S.BREAKOUT_PAD_BP/10_000
         side=None; level=None
-        # Fake-move guard: adverse wick
         rng=max(h[-1]-l[-1],1e-12)
-        if (h[-1]-max(c[-1],o[-1]))/rng>S.WICK_SIDE_MAX: pass    # checked per side below
-        if (min(c[-1],o[-1])-l[-1])/rng>S.WICK_SIDE_MAX: pass
         if c[-1]>ph*(1+pad) and br>=S.BODY_RATIO_MIN:
-            # long wick guard
             upper_wick=(h[-1]-max(c[-1],o[-1]))/rng
             if upper_wick<=S.WICK_SIDE_MAX: side,level="LONG",ph
         elif c[-1]<pl*(1-pad) and br>=S.BODY_RATIO_MIN:
@@ -438,19 +481,22 @@ DEP = DepthTracker() if S.ENABLE_WALLS else None
 
 LAST_TRADE_TS: Dict[str, int] = {}
 OPEN_TRADES: Dict[str, Dict[str, Any]] = {}
+CONSEC_LOSSES: int = 0
 
 DAILY_STATS: Dict[str, Dict[str, Any]] = defaultdict(lambda: {
     "count": 0, "wins_tp2": 0, "wins_ts": 0, "losses_sl": 0,
     "sum_R": 0.0, "best": None, "worst": None
 })
 def stats_add_trade_result(symbol: str, R: float, outcome: str):
+    global CONSEC_LOSSES
     key = local_day_key(); st = DAILY_STATS[key]
     st["count"] += 1; st["sum_R"] += R
-    if outcome == "TP2": st["wins_tp2"] += 1
-    elif outcome == "TS": st["wins_ts"] += 1
-    elif outcome == "SL": st["losses_sl"] += 1
+    if outcome == "TP2": st["wins_tp2"] += 1; CONSEC_LOSSES = 0
+    elif outcome == "TS": st["wins_ts"] += 1; CONSEC_LOSSES = 0
+    elif outcome == "SL": st["losses_sl"] += 1; CONSEC_LOSSES += 1
     if st["best"] is None or R > st["best"][1]: st["best"] = (symbol, R)
     if st["worst"] is None or R < st["worst"][1]: st["worst"] = (symbol, R)
+
 def compose_daily_summary() -> str:
     key = local_day_key(); st = DAILY_STATS.get(key, {})
     if not st or st["count"] == 0: return f"📅 Daily Stats – {key}\nNo trades today."
@@ -462,7 +508,8 @@ def compose_daily_summary() -> str:
     return (f"📅 Daily Stats – {key}\nTrades: {st['count']}\n"
             f"Wins: {wins} (TP2 {st['wins_tp2']}, TS {st['wins_ts']}) | Losses: {losses}\n"
             f"Hit rate: {hit:.1f}% | Net: {st['sum_R']:+.2f}R | Avg: {avg_R:+.2f}R\n"
-            f"Best: {best}   Worst: {worst}")
+            f"Best: {best}   Worst: {worst}   Consecutive losses: {CONSEC_LOSSES}")
+
 def seconds_until_next_2200_riyadh() -> float:
     now = riyadh_now(); target = now.replace(hour=22, minute=0, second=0, microsecond=0)
     if now >= target: target = target + timedelta(days=1)
@@ -483,7 +530,7 @@ async def fetch_oi_relaxed_ok(symbol: str, side: str) -> bool:
     try:
         hist = await BINANCE_CLIENT.open_interest_hist(symbol, period=S.OI_LOOKBACK, limit=30)
         cur  = await BINANCE_CLIENT.open_interest(symbol)
-        if not hist or cur is None: return True   # don't block on missing OI
+        if not hist or cur is None: return True
         prev = hist[:-1] if len(hist)>1 else hist
         if len(prev) < 5: return True
         mean = sum(prev)/len(prev)
@@ -491,15 +538,60 @@ async def fetch_oi_relaxed_ok(symbol: str, side: str) -> bool:
         std  = math.sqrt(var) if var>0 else 0.0
         z = 0.0 if std==0 else (cur - mean)/std
         delta_pct = (cur-mean)/mean if mean>0 else 0.0
-        step = cur - prev[-1]   # last-step slope
+        step = cur - prev[-1]
         trend_ok = (step >= 0) if side=="LONG" else (step <= 0)
         signal_ok = (z >= S.OI_Z_MIN) or (delta_pct >= S.OI_DELTA_MIN)
-        if z >= (S.OI_Z_MIN * 1.5):  # strong spike bypass
+        if z >= (S.OI_Z_MIN * 1.5):
             return True
         return signal_ok and trend_ok
     except Exception as e:
         log.warning("oi_check_error", symbol=symbol, error=str(e))
         return True
+
+# ---------- Consensus helpers ----------
+def _spread_bps(sym:str)->Optional[float]:
+    top = OB.top(sym)
+    if not top: return None
+    mid = (top.ask_price + top.bid_price)/2.0
+    if mid <= 0: return None
+    return bps((top.ask_price - top.bid_price)/mid)
+
+def _atr1m_bps(sym:str)->Optional[float]:
+    b = BE.buffers.get((sym,"1m"))
+    if not b or len(b["c"]) < S.RSI_LEN + 15: return None
+    a = atr(list(b["h"]), list(b["l"]), list(b["c"]), 14)
+    c = b["c"][-1]
+    if a is None or c<=0: return None
+    return bps(a / c)
+
+def _rsi_dir_conf(sym:str)->Tuple[Optional[str], float, Optional[float]]:
+    b = BE.buffers.get((sym,"1m"))
+    if not b: return None, 0.0, None
+    r = rsi(list(b["c"]), S.RSI_LEN)
+    if r is None: return None, 0.0, None
+    if r >= S.RSI_HIGH:
+        # confidence grows from RSI_HIGH→80 mapped to 0→1
+        conf = min(1.0, max(0.0, (r - S.RSI_HIGH) / max(1.0, 80.0 - S.RSI_HIGH)))
+        return "LONG", conf, r
+    elif r <= S.RSI_LOW:
+        conf = min(1.0, max(0.0, (S.RSI_LOW - r) / max(1.0, S.RSI_LOW - 20.0)))
+        return "SHORT", conf, r
+    else:
+        return None, 0.0, r
+
+def _pmm_imbalance(sym:str)->Optional[float]:
+    top = OB.top(sym)
+    if not top: return None
+    den = (top.bid_qty + top.ask_qty)
+    if den <= 0: return None
+    return float(top.bid_qty / den)  # 0..1 (buy-side share)
+
+def _grid_aligned(price: float, step_bp: float, side: str) -> bool:
+    if step_bp <= 0: return False
+    step = step_bp/10_000.0
+    grid = round(price / (price*step)) * (price*step)
+    dist = abs(price - grid)
+    return (dist <= price*step*0.15)  # within 15% of step size
 
 # ----------- Handlers -----------
 async def on_kline(symbol:str, k:dict):
@@ -507,7 +599,7 @@ async def on_kline(symbol:str, k:dict):
     def _f(x): 
         try: return float(x)
         except: return 0.0
-    # QUOTE volume in WS kline is 'q' — keep quote consistently
+    # QUOTE volume in WS kline is 'q'
     cndl=Candle(int(k["t"]), _f(k["o"]), _f(k["h"]), _f(k["l"]), _f(k["c"]), _f(k.get("q", 0.0)), int(k["T"]))
     BE.add_candle(sym, tf, cndl)
     STATE["last_kline"]={"symbol":sym,"tf":tf,"t":k["T"]}
@@ -517,7 +609,7 @@ async def on_kline(symbol:str, k:dict):
         _maybe_debug_drop(sym, tf, "no_candidate", {"close": cndl.close})
         return
 
-    # HTF bias for 5m via 15m SMA + slope (corrected)
+    # HTF bias (15m SMA + slope gate for 5m)
     if tf=="5m":
         buf=BE.buffers.get((sym,"15m"))
         if buf and len(buf["c"])>=S.HTF_SMA_LEN:
@@ -533,7 +625,7 @@ async def on_kline(symbol:str, k:dict):
         else:
             sig.htf_bias_ok=True
 
-    # Volume Z-score (quote volume only)
+    # Volume Z-score (quote)
     buf=BE.buffers.get((sym,tf))
     vol_z = 0.0
     if buf and len(buf["v"])>=30:
@@ -545,12 +637,12 @@ async def on_kline(symbol:str, k:dict):
         _maybe_debug_drop(sym, tf, "vol_z_low", {"vol_z": round(vol_z,3), "min": S.VOL_Z_MIN})
         return
 
-    # OI relaxed check (fixed)
+    # OI relaxed check
     if not await fetch_oi_relaxed_ok(sym, sig.side):
         _maybe_debug_drop(sym, tf, "oi_block", {"side": sig.side})
         return
 
-    # CVD sign confirmation (near-flat allowed)
+    # CVD sign
     if S.ENABLE_CVD and CVD:
         slope = CVD.slope(sym)
         if S.CVD_REQUIRE_SIGN:
@@ -563,14 +655,40 @@ async def on_kline(symbol:str, k:dict):
     else:
         slope = 0.0
 
-    # Liquidity wall avoidance near breakout ref (per-side median)
+    # Liquidity wall avoidance
     if S.ENABLE_WALLS and DEP:
         ref = sig.level * (1+S.BREAKOUT_PAD_BP/10_000) if sig.side=="LONG" else sig.level*(1-S.BREAKOUT_PAD_BP/10_000)
         if DEP.has_opposite_wall(sym, sig.side, ref, S.WALL_BAND_BP, S.WALL_MULT):
             _maybe_debug_drop(sym, tf, "wall_block", {"ref": round(ref,6), "band_bp": S.WALL_BAND_BP, "mult": S.WALL_MULT})
             return
 
-    # Cooldown after trade open / avoid duplicate
+    # ------------- Consensus Router (optional) -------------
+    if S.CONSENSUS_ROUTER:
+        # Quality gates
+        sp = _spread_bps(sym)
+        if sp is None or sp > S.SPREAD_BPS_MAX:
+            _maybe_debug_drop(sym, tf, "spread_gate", {"spread_bps": round(sp or -1,2), "max": S.SPREAD_BPS_MAX})
+            return
+        a1 = _atr1m_bps(sym)
+        if a1 is None or a1 < S.ATR1M_MIN_BPS or a1 > S.ATR1M_MAX_BPS:
+            _maybe_debug_drop(sym, tf, "atr1m_gate", {"atr1m_bps": round(a1 or -1,2), "min": S.ATR1M_MIN_BPS, "max": S.ATR1M_MAX_BPS})
+            return
+        if OB.top(sym) is None or DEP.last_depth.get(sym) is None:
+            _maybe_debug_drop(sym, tf, "data_gate", {})
+            return
+
+        # Trigger rule: BR & RSI must agree + confidences
+        rsi_dir, rsi_conf, rsi_val = _rsi_dir_conf(sym)
+        if rsi_dir is None or rsi_dir != sig.side:
+            _maybe_debug_drop(sym, tf, "rsi_disagree", {"side": sig.side, "rsi_dir": rsi_dir, "rsi": rsi_val})
+            return
+        # BR confidence from body ratio
+        br_conf = max(0.0, min(1.0, (sig.body_ratio - S.BODY_RATIO_MIN) / max(1e-6, 1.0 - S.BODY_RATIO_MIN)))
+        if rsi_conf < S.CONS_MIN or br_conf < S.CONS_MIN:
+            _maybe_debug_drop(sym, tf, "conf_low", {"rsi_conf": round(rsi_conf,2), "br_conf": round(br_conf,2), "min": S.CONS_MIN})
+            return
+
+    # Cooldown / duplicate
     now_ts = int(time.time())
     if now_ts - LAST_TRADE_TS.get(sym, 0) < S.COOLDOWN_AFTER_TRADE_SEC:
         _maybe_debug_drop(sym, tf, "cooldown", {"cooldown_sec": S.COOLDOWN_AFTER_TRADE_SEC})
@@ -579,9 +697,65 @@ async def on_kline(symbol:str, k:dict):
         _maybe_debug_drop(sym, tf, "already_open", {})
         return
 
-    # Build plan: entry/SL/TPs (R:R=1:2), trail after TP1
+    # ---------- Build plan ----------
+    top = OB.top(sym)
+    mid = (top.ask_price + top.bid_price)/2.0 if top else sig.price
     atr_val = sig.atr_val if sig.atr_val and sig.atr_val>0 else (sig.price*0.003)
     pad = S.BREAKOUT_PAD_BP / 10_000
+
+    if S.CONSENSUS_ROUTER:
+        # Fee-aware micro targets / stops on 1m
+        entry = sig.level * (1 + pad) if sig.side=="LONG" else sig.level * (1 - pad)
+        sl = from_bps(S.SL_BPS, entry, sig.side, -1 if sig.side=="LONG" else +1)
+        tp1 = from_bps(S.TP1_BPS, entry, sig.side, +1 if sig.side=="LONG" else -1)
+        # trail based on 1m ATR
+        a1 = _atr1m_bps(sym) or 10.0
+        trail_dist = (a1/10_000.0) * mid * S.TRAIL_ATR1M_MULT
+        risk = abs(entry - sl)
+
+        # Sizing & boosters (display only in DRY_RUN)
+        qty_txt = "—"
+        if S.ACCOUNT_EQUITY_USDT and S.ACCOUNT_EQUITY_USDT>0 and risk>0:
+            base_qty = (S.ACCOUNT_EQUITY_USDT * (S.MAX_RISK_PCT/100.0)) / risk
+            # PMM booster
+            imb = _pmm_imbalance(sym)
+            if imb is not None:
+                if (sig.side=="LONG" and imb >= S.PMM_IMB_GREEN) or (sig.side=="SHORT" and imb <= (1.0 - S.PMM_IMB_GREEN)):
+                    base_qty *= (1.0 + S.PMM_SIZE_BOOST)
+            # Grid booster
+            if _grid_aligned(entry, S.GRID_STEP_BP, sig.side):
+                base_qty *= (1.0 + S.GRID_SIZE_BOOST)
+            # Cap by max order value
+            if S.MAX_ORDER_VALUE_USDT:
+                base_qty = min(base_qty, S.MAX_ORDER_VALUE_USDT / max(entry,1e-9))
+            qty_txt = f"{base_qty:.4f}"
+
+        OPEN_TRADES[sym] = {
+            "symbol": sym, "side": sig.side, "tf": tf,
+            "entry": entry, "sl": sl, "tp1": tp1, "tp2": None,  # TP2 replaced by trail
+            "risk": risk,
+            "opened_ts": now_ts,
+            "tp1_hit": False, "trail_active": False, "trail_peak": None,
+            "trail_dist": trail_dist, "atr_at_entry": atr_val,
+            "time_stop": now_ts + int(min(max(S.TIME_STOP_SEC_MIN, 240), S.TIME_STOP_SEC_MAX))
+        }
+        LAST_TRADE_TS[sym] = now_ts
+
+        text=(f"{'✅ LONG' if sig.side=='LONG' else '❌ SHORT'} <b>{sym}</b> <code>{tf}</code> (Consensus)\n"
+              f"Price: <b>{sig.price:.6f}</b>  Level: {sig.level:.6f}  Body: {sig.body_ratio:.2f}\n"
+              f"VolZ: {vol_z:.2f}  CVD slope: {slope:.4f}  Spread(bps): {(_spread_bps(sym) or 0):.2f}\n"
+              f"RSI(1m): {(_rsi_dir_conf(sym)[2] or 0):.1f}  HTF bias: {'✅' if sig.htf_bias_ok else '❌'}  Sweep/Reclaim: {'✅' if sig.sweep_reclaim else '—'}\n"
+              f"\n<b>Plan</b> (limit-maker near retest):\n"
+              f"Entry: <b>{entry:.6f}</b>\n"
+              f"SL (~{S.SL_BPS:.0f}bps): <b>{sl:.6f}</b>\n"
+              f"TP1 (~{S.TP1_BPS:.0f}bps): <b>{tp1:.6f}</b>\n"
+              f"Trail after TP1: ATR(1m)×{S.TRAIL_ATR1M_MULT:.2f}\n"
+              f"Qty: {qty_txt}")
+        await alert(text, sym)
+        _log_event({"ts": now_ts, "type": "signal_consensus", "symbol": sym, "side": sig.side, "entry": entry, "sl": sl, "tp1": tp1})
+        return
+
+    # ------- Original (R:R=1:2) path -------
     if S.ENTRY_MODE.upper() == "RETEST":
         entry = sig.level * (1 + pad) if sig.side == "LONG" else sig.level * (1 - pad)
         entry_note = "retest"
@@ -605,25 +779,23 @@ async def on_kline(symbol:str, k:dict):
         "risk": risk,
         "opened_ts": now_ts,
         "tp1_hit": False, "trail_active": False, "trail_peak": None,
-        "trail_dist": atr_val * S.TRAIL_ATR_MULT, "atr_at_entry": atr_val
+        "trail_dist": atr_val * S.TRAIL_ATR_MULT, "atr_at_entry": atr_val,
+        "time_stop": None
     }
     LAST_TRADE_TS[sym] = now_ts
 
-    tz_dt=to_tz(now_utc(), S.TZ)
     sl_pct=_fmt_pct(sl, entry); tp1_pct=_fmt_pct(tp1, entry); tp2_pct=_fmt_pct(tp2, entry)
-    direction="✅ LONG" if sig.side=="LONG" else "❌ SHORT"
-    text=(f"{direction} <b>{sym}</b> <code>{tf}</code>\n"
+    text=(f"{'✅ LONG' if sig.side=='LONG' else '❌ SHORT'} <b>{sym}</b> <code>{tf}</code>\n"
           f"Price: <b>{sig.price:.6f}</b>  Level: {sig.level:.6f}  Body: {sig.body_ratio:.2f}\n"
           f"VolZ: {vol_z:.2f}  CVD slope: {slope:.4f}\n"
           f"HTF bias: {'✅' if sig.htf_bias_ok else '❌'}  Sweep/Reclaim: {'✅' if sig.sweep_reclaim else '—'}\n"
-          f"Time: {tz_dt.isoformat()}\n"
-          f"\n<b>Plan</b> ({entry_note}, R:R = 1:2):\n"
+          f"\n<b>Plan</b> ({'retest' if S.ENTRY_MODE.upper()=='RETEST' else 'market'}, R:R=1:2):\n"
           f"Entry: <b>{entry:.6f}</b>\n"
           f"SL: <b>{sl:.6f}</b>  ({sl_pct:+.2f}%)\n"
           f"TP1: <b>{tp1:.6f}</b>  ({tp1_pct:+.2f}%)\n"
           f"TP2: <b>{tp2:.6f}</b>  ({tp2_pct:+.2f}%)\n"
-          f"Trailing: starts after TP1 (ATR×{S.TRAIL_ATR_MULT:.2f})\n"
-          f"Risk%: {S.MAX_RISK_PCT:.2f}%   Qty: {qty_txt}")
+          f"Trailing after TP1: ATR×{S.TRAIL_ATR_MULT:.2f}\n"
+          f"Qty: {qty_txt}")
     await alert(text, sym)
     _log_event({"ts": now_ts, "type": "signal", "symbol": sym, "side": sig.side, "entry": entry, "sl": sl, "tp1": tp1, "tp2": tp2})
 
@@ -640,6 +812,20 @@ async def on_bookticker(symbol:str, data:dict):
     entry = trade["entry"]; sl = trade["sl"]; tp1 = trade["tp1"]; tp2 = trade["tp2"]
     trail_dist = trade["trail_dist"]
 
+    # Veto: toxic book pre-exit (router mode) — if book turns 70/30 against, arm trail ASAP
+    if S.CONSENSUS_ROUTER:
+        imb = _pmm_imbalance(sym)
+        if imb is not None:
+            against = (imb < (1.0 - S.TOXIC_IMB_THRESH)) if side=="LONG" else (imb > S.TOXIC_IMB_THRESH)
+            if against and not trade["tp1_hit"]:
+                # simulate early tighten: pull SL a bit closer (halfway)
+                if side=="LONG": trade["sl"] = max(trade["sl"], entry - (entry - trade["sl"])*0.5)
+                else: trade["sl"] = min(trade["sl"], entry + (trade["sl"] - entry)*0.5)
+
+    # Time stop (router mode)
+    if S.CONSENSUS_ROUTER and trade.get("time_stop") and int(time.time()) >= trade["time_stop"] and not trade["tp1_hit"]:
+        await _close_trade(sym, "TS", mid, entry, trade["risk"]); return
+
     if not trade["tp1_hit"]:
         if side == "LONG":
             if mid <= sl: await _close_trade(sym, "SL", mid, entry, trade["risk"]); return
@@ -651,13 +837,14 @@ async def on_bookticker(symbol:str, data:dict):
                 trade["tp1_hit"] = True; trade["trail_active"] = True; trade["trail_peak"] = mid
         return
 
+    # After TP1: trail (router mode uses trail only, original also has TP2)
     if side == "LONG":
         if trade["trail_active"]:
             trade["trail_peak"] = max(trade["trail_peak"], mid)
             trail_stop = trade["trail_peak"] - trail_dist
             if mid <= trail_stop:
                 await _close_trade(sym, "TS", trail_stop, entry, trade["risk"]); return
-        if mid >= tp2:
+        if not S.CONSENSUS_ROUTER and tp2 and mid >= tp2:
             await _close_trade(sym, "TP2", tp2, entry, trade["risk"]); return
     else:
         if trade["trail_active"]:
@@ -665,7 +852,7 @@ async def on_bookticker(symbol:str, data:dict):
             trail_stop = trade["trail_peak"] + trail_dist
             if mid >= trail_stop:
                 await _close_trade(sym, "TS", trail_stop, entry, trade["risk"]); return
-        if mid <= tp2:
+        if not S.CONSENSUS_ROUTER and tp2 and mid <= tp2:
             await _close_trade(sym, "TP2", tp2, entry, trade["risk"]); return
 
 async def on_aggtrade(symbol:str, data:dict):
@@ -700,7 +887,7 @@ async def _close_trade(symbol: str, outcome: str, exit_price: float, entry: floa
            f"Outcome: <b>{outcome}</b>\n"
            f"Entry: {entry:.6f} → Exit: {exit_price:.6f}  (PnL: {pl_pct:+.2f}% | {R:+.2f}R)\n"
            f"TP1 hit: {'✅' if trade.get('tp1_hit') else '—'}\n"
-           f"Duration: {dur_min:.1f} min  |  Trail ATR: {trade.get('atr_at_entry'):.6f} × {S.TRAIL_ATR_MULT:.2f}")
+           f"Duration: {dur_min:.1f} min")
     await alert(msg, symbol)
     _log_event({"ts": int(time.time()), "type": "result", "symbol": symbol, "outcome": outcome, "entry": entry, "exit": exit_price, "pnl_pct": pl_pct, "R": R, "tp1_hit": trade.get("tp1_hit")})
 
@@ -721,12 +908,12 @@ async def small_backfill(client:"BinanceClient", sym:str, tf:str):
     for k in data[:-1]:
         # REST kline fields: [0]t, [1]o,[2]h,[3]l,[4]c,[5]base vol,[6]T,[7]quote vol, ...
         o,h,l,c = float(k[1]),float(k[2]),float(k[3]),float(k[4])
-        q_quote = float(k[7]) if len(k)>7 else 0.0   # FIX: use QUOTE vol to match WS
+        q_quote = float(k[7]) if len(k)>7 else 0.0   # QUOTE vol (fixed)
         BE.add_candle(sym, tf, Candle(int(k[0]), o, h, l, c, q_quote, int(k[6])))
 
 async def main():
     global REST_SESSION, BINANCE_CLIENT
-    log.info("boot", tfs=S.TIMEFRAMES, rr="1:2", trailing_after_tp1=True, cooldown_after_trade_sec=S.COOLDOWN_AFTER_TRADE_SEC)
+    log.info("boot", tfs=S.TIMEFRAMES, rr="1:2", trailing_after_tp1=True, cooldown_after_trade_sec=S.COOLDOWN_AFTER_TRADE_SEC, consensus=S.CONSENSUS_ROUTER)
     asyncio.create_task(start_http_server(STATE))
     asyncio.create_task(daily_stats_loop())
 
@@ -741,17 +928,23 @@ async def main():
     else:
         symbols=[str(S.SYMBOLS)]
     STATE["symbols"]=symbols
-    log.info("symbols_selected", count=len(symbols))
+
+    # Timeframes — if consensus router is ON, make sure "1m" is present internally
+    tfs = list(S.TIMEFRAMES)
+    if S.CONSENSUS_ROUTER and "1m" not in tfs:
+        tfs = ["1m"] + tfs
+    STATE["timeframes"]=tfs
+    log.info("symbols_selected", count=len(symbols), tfs=tfs)
 
     # Backfill
     for i, sym in enumerate(symbols):
-        for tf in S.TIMEFRAMES:
+        for tf in tfs:
             try: await small_backfill(BINANCE_CLIENT, sym, tf)
             except Exception as e: log.warning("backfill_error", symbol=sym, tf=tf, error=str(e))
         if i % 10 == 0: await asyncio.sleep(0.2)
 
     # Streams
-    ws_multi=WSStreamMulti(symbols, S.TIMEFRAMES, on_kline, on_bookticker, on_aggtrade, on_depth, chunk_size=S.WS_CHUNK_SIZE)
+    ws_multi=WSStreamMulti(symbols, tfs, on_kline, on_bookticker, on_aggtrade, on_depth, chunk_size=S.WS_CHUNK_SIZE)
     await ws_multi.run()
 
 if __name__=="__main__":
