@@ -1,11 +1,11 @@
-# app.py — Binance USDT-M Perps Breakout Bot (FORCE EXEC FIRST, ALERT AFTER)
+# app.py — Binance USDT-M Perps Breakout Bot (FORCE EXEC FIRST, FIXED SIGNING)
 # Core: Breakout + body, quick retest, sweep & reclaim, HTF(15m) bias gating 5m
 # Flow: CVD slope (aggTrade), liquidity wall avoidance (depth5), Volume Z-score
 # OI (relaxed): z-score OR delta, direction-aligned
 # Risk: R:R=1:2 (TP1, TP2), trailing only after TP1
 # Ops: 4h cooldown per ticker, daily stats 22:00 Riyadh, /healthz, Telegram alerts
-# Force: If FORCE_EXECUTE_ON_ALERT=true & DRY_RUN=false -> place MARKET order FIRST, then alert.
-# Diagnostics: Futures readiness check at boot; detailed Telegram error on any order failure.
+# Force: If FORCE_EXECUTE_ON_ALERT=true & DRY_RUN=false -> place MARKET first, then alert.
+# Diagnostics: Futures readiness check; detailed Telegram error on any order failure.
 
 import sys, subprocess, os
 def _ensure(pkgs):
@@ -21,7 +21,7 @@ def _ensure(pkgs):
 _ensure(["aiohttp>=3.9.5","uvloop>=0.19.0","pydantic>=2.7.0","pydantic-settings>=2.2.1",
          "structlog>=24.1.0","tzdata>=2024.1","orjson>=3.10.7"])
 
-import asyncio, aiohttp, orjson, time, math, hmac, hashlib
+import asyncio, aiohttp, orjson, time, math, hmac, hashlib, urllib.parse
 from typing import List, Dict, Any, Optional, Deque, Tuple
 from collections import deque, defaultdict
 from datetime import datetime, timedelta, timezone
@@ -197,21 +197,58 @@ class BinanceClient:
             d=await r.json()
             return float(d.get("openInterest", 0))
 
-# --- Futures signing & requests ---
-def _sign(params: dict, secret: str) -> str:
-    qs = "&".join([f"{k}={params[k]}" for k in sorted(params)])
-    return hmac.new(secret.encode(), qs.encode(), hashlib.sha256).hexdigest()
+# --- Signing & private requests (FIXED: sign exact qs we send) ---
+def _sign_querystring(qs: str, secret: str) -> str:
+    return hmac.new(secret.encode("utf-8"), qs.encode("utf-8"), hashlib.sha256).hexdigest()
 
-async def _fapi(method, path, params):
-    api_key=os.getenv("BINANCE_API_KEY"); api_secret=os.getenv("BINANCE_API_SECRET")
-    if not api_key or not api_secret: raise RuntimeError("Missing API keys")
-    params=dict(params); params["timestamp"]=int(time.time()*1000); params["recvWindow"]=5000
-    params["signature"]=_sign(params, api_secret)
-    url=f"{BASE_REST}{path}"; headers={"X-MBX-APIKEY": api_key}
-    async with REST_SESSION.request(method, url, params=params, headers=headers) as r:
-        txt=await r.text()
-        if r.status!=200: raise RuntimeError(f"Binance error {r.status}: {txt}")
-        return await r.json()
+def _encode(params_items: list[tuple[str, str | int | float]]) -> str:
+    # urlencode without reordering; keep tuple order exactly as given
+    return urllib.parse.urlencode(params_items, doseq=True, safe=":/")
+
+async def _fapi(method: str, path: str, params: dict | list[tuple[str, Any]]):
+    """
+    Binance Futures private call:
+    - Build ordered querystring manually
+    - HMAC-SHA256 over *exact* qs
+    - Send qs unchanged (GET: in URL, POST/DELETE: as x-www-form-urlencoded body)
+    """
+    api_key = os.getenv("BINANCE_API_KEY")
+    api_secret = os.getenv("BINANCE_API_SECRET")
+    if not api_key or not api_secret:
+        raise RuntimeError("Missing API keys")
+
+    # ordered items
+    if isinstance(params, dict):
+        items = list(params.items())        # preserves insertion order (Py3.7+)
+    else:
+        items = list(params)
+
+    # required fields (append in this order)
+    items.append(("timestamp", int(time.time() * 1000)))
+    if not any(k == "recvWindow" for k, _ in items):
+        items.append(("recvWindow", 60000))
+
+    qs = _encode(items)
+    sig = _sign_querystring(qs, api_secret)
+    qs_signed = f"{qs}&signature={sig}"
+
+    url = f"{BASE_REST}{path}"
+    headers = {"X-MBX-APIKEY": api_key, "Content-Type": "application/x-www-form-urlencoded"}
+
+    if method.upper() == "GET":
+        url = f"{url}?{qs_signed}"
+        data = None
+    else:
+        data = qs_signed
+
+    async with REST_SESSION.request(method.upper(), url, data=data, headers=headers) as r:
+        txt = await r.text()
+        if r.status != 200:
+            raise RuntimeError(f"Binance error {r.status}: {txt}")
+        try:
+            return await r.json()
+        except Exception:
+            return txt
 
 # --- Readiness check (Futures permission / connectivity) ---
 async def _futures_ready_check():
@@ -559,7 +596,6 @@ async def fetch_oi_relaxed_ok(symbol: str, side: str) -> bool:
 
 # ----------- LIVE FORCE EXEC: place MARKET first, then alert (diagnostic) -----------
 async def live_force_execute(sym: str, side: str, entry: float, sl: float) -> Optional[Dict[str,Any]]:
-    # Respect DRY_RUN
     if os.getenv("DRY_RUN", str(S.DRY_RUN)).lower() == "true":
         await alert(f"🟡 DRY_RUN true — skipping live order for {sym}", sym)
         return {"dry": True, "note": "DRY_RUN"}
@@ -575,7 +611,6 @@ async def live_force_execute(sym: str, side: str, entry: float, sl: float) -> Op
             await load_symbol_filters()
         await ensure_symbol_setup(sym)
 
-        # Compute qty
         equity = float(os.getenv("ACCOUNT_EQUITY_USDT","0") or 0) or (S.ACCOUNT_EQUITY_USDT or 1000.0)
         max_risk_pct = float(os.getenv("MAX_RISK_PCT", S.MAX_RISK_PCT))
         notional_max_pct = float(os.getenv("NOTIONAL_MAX_PCT","100"))
@@ -583,10 +618,8 @@ async def live_force_execute(sym: str, side: str, entry: float, sl: float) -> Op
 
         qty = compute_qty(sym, entry, sl, equity, max_risk_pct, notional_max_pct, leverage)
 
-        # Enforce exchange minimums (approx min notional $5)
         f=_SYMBOL_FILTERS.get(sym,{}); min_qty=max(f.get("minQty",0.0),0.0)
-        top=OB.top(sym)
-        px = entry if entry>0 else ((top.ask_price+top.bid_price)/2 if top else entry)
+        top=OB.top(sym); px = entry if entry>0 else ((top.ask_price+top.bid_price)/2 if top else entry)
         if S.AUTO_RAISE_TO_MIN_NOTIONAL:
             qty = max(qty, min_qty)
             if qty*max(px,1e-9) < 5.0:
@@ -599,7 +632,6 @@ async def live_force_execute(sym: str, side: str, entry: float, sl: float) -> Op
             await alert(f"❗️<b>ORDER SKIPPED</b> {sym}\n{m}\nLikely SL=Entry or minQty too large.", sym)
             return None
 
-        # MARKET entry (guaranteed)
         side_word = "BUY" if side=="LONG" else "SELL"
         body = {"symbol": sym, "side": side_word, "type": "MARKET", "quantity": f"{round_qty(sym, qty):.8f}"}
         try:
@@ -618,7 +650,6 @@ async def live_force_execute(sym: str, side: str, entry: float, sl: float) -> Op
             )
             return None
 
-        # SL as STOP_MARKET closePosition
         try:
             await place_stop_market_close(sym, side, sl)
         except Exception as e:
@@ -645,7 +676,6 @@ async def on_kline(symbol:str, k:dict):
     sig=BE.on_closed_bar(sym, tf)
     if not sig: return
 
-    # HTF bias for 5m using 15m SMA
     if tf=="5m":
         buf=BE.buffers.get((sym,"15m"))
         if buf and len(buf["c"])>=S.HTF_SMA_LEN:
@@ -654,7 +684,6 @@ async def on_kline(symbol:str, k:dict):
         else: sig.htf_bias_ok=True
     if not getattr(sig,"htf_bias_ok",True): return
 
-    # Volume Z-score (30-sample window)
     buf=BE.buffers.get((sym,tf)); vol_z=0.0
     if buf and len(buf["v"])>=30:
         vols=list(buf["v"]); win=vols[-30:-1]
@@ -663,10 +692,8 @@ async def on_kline(symbol:str, k:dict):
             vol_z=(vols[-1]-mean)/std
     if vol_z < S.VOL_Z_MIN: return
 
-    # OI relaxed check
     if not await fetch_oi_relaxed_ok(sym, sig.side): return
 
-    # CVD slope sign
     if S.ENABLE_CVD and CVD:
         slope=CVD.slope(sym)
         if S.CVD_REQUIRE_SIGN:
@@ -675,14 +702,12 @@ async def on_kline(symbol:str, k:dict):
     else:
         slope=0.0
 
-    # Liquidity wall avoidance
     if S.ENABLE_WALLS and DEP:
         ref = sig.level*(1+S.BREAKOUT_PAD_BP/10_000) if sig.side=="LONG" else sig.level*(1-S.BREAKOUT_PAD_BP/10_000)
         if DEP.has_opposite_wall(sym, sig.side, ref, S.WALL_BAND_BP, S.WALL_MULT): return
 
-    # Cooldown & duplicates
     now_ts=int(time.time())
-    if not S.FORCE_EXECUTE_ON_ALERT:  # normal mode
+    if not S.FORCE_EXECUTE_ON_ALERT:
         if now_ts - LAST_TRADE_TS.get(sym,0) < S.COOLDOWN_AFTER_TRADE_SEC: return
         if sym in OPEN_TRADES: return
     else:
@@ -690,7 +715,6 @@ async def on_kline(symbol:str, k:dict):
             LAST_TRADE_TS[sym]=0
         OPEN_TRADES.pop(sym, None)
 
-    # Build plan (R:R 1:2)
     atr_val = sig.atr_val if sig.atr_val and sig.atr_val>0 else (sig.price*0.003)
     pad = S.BREAKOUT_PAD_BP/10_000
     if S.ENTRY_MODE.upper()=="RETEST":
@@ -703,12 +727,10 @@ async def on_kline(symbol:str, k:dict):
     tp1 = entry + risk if sig.side=="LONG" else entry - risk
     tp2 = entry + 2*risk if sig.side=="LONG" else entry - 2*risk
 
-    # FORCE EXECUTE FIRST (MARKET), THEN ALERT
     order_resp=None
     if S.FORCE_EXECUTE_ON_ALERT:
         order_resp = await live_force_execute(sym, sig.side, entry, sl)
 
-    # Register trade locally (for TP/TS management)
     OPEN_TRADES[sym]={
         "symbol":sym, "side":sig.side, "tf":tf,
         "entry":entry, "sl":sl, "tp1":tp1, "tp2":tp2, "risk":risk,
@@ -717,7 +739,6 @@ async def on_kline(symbol:str, k:dict):
     }
     LAST_TRADE_TS[sym]=now_ts
 
-    # After execution -> send alert
     tz_dt=to_tz(now_utc(), S.TZ)
     sl_pct=_fmt_pct(sl, entry); tp1_pct=_fmt_pct(tp1, entry); tp2_pct=_fmt_pct(tp2, entry)
     direction="✅ LONG" if sig.side=="LONG" else "❌ SHORT"
@@ -834,11 +855,9 @@ async def main():
     REST_SESSION=aiohttp.ClientSession()
     BINANCE_CLIENT=BinanceClient(REST_SESSION)
 
-    # Check futures access once (only when live)
     if os.getenv("DRY_RUN", str(S.DRY_RUN)).lower() == "false":
         await _futures_ready_check()
 
-    # Symbols
     if S.SYMBOLS=="ALL" or (isinstance(S.SYMBOLS,str) and S.SYMBOLS.upper()=="ALL"):
         symbols=await discover_perp_usdt_symbols(REST_SESSION, S.MAX_SYMBOLS)
     elif isinstance(S.SYMBOLS,(list,tuple)):
@@ -848,14 +867,12 @@ async def main():
     STATE["symbols"]=symbols
     log.info("symbols_selected", count=len(symbols))
 
-    # Backfill
     for i, sym in enumerate(symbols):
         for tf in S.TIMEFRAMES:
             try: await small_backfill(BINANCE_CLIENT, sym, tf)
             except Exception as e: log.warning("backfill_error", symbol=sym, tf=tf, error=str(e))
         if i % 10 == 0: await asyncio.sleep(0.2)
 
-    # Streams
     ws_multi=WSStreamMulti(symbols, S.TIMEFRAMES, on_kline, on_bookticker, on_aggtrade, on_depth, chunk_size=S.WS_CHUNK_SIZE)
     await ws_multi.run()
 
