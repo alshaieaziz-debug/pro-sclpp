@@ -1,6 +1,6 @@
 # app.py — Binance USDT-M Scalper
 # ENTER FIRST (MARKET) → poll fill → place SL/TP → alert
-# Uses actual exchange fills for entry/exit, and reports PnL **after fees**.
+# Trailing uses maker LIMIT with panic taker fallback (percent-based fees & slippage).
 
 import sys, subprocess, os
 def _ensure(pkgs):
@@ -69,9 +69,16 @@ class Settings(BaseSettings):
     DRY_RUN: bool = True
     TRAIL_ATR_MULT: float = 1.0
 
-    # Fees (bps) – adjust to your VIP level
-    FEE_TAKER_BPS: float = float(os.getenv("FEE_TAKER_BPS", "4.0"))   # 0.04%
-    FEE_MAKER_BPS: float = float(os.getenv("FEE_MAKER_BPS", "2.0"))   # 0.02%
+    # ---------- Fees & slippage IN PERCENT (0.04 = 0.04%) ----------
+    FEE_TAKER_PCT: float = float(os.getenv("FEE_TAKER_PCT", "0.04"))
+    FEE_MAKER_PCT: float = float(os.getenv("FEE_MAKER_PCT", "0.02"))
+    SLIPPAGE_PCT:  float = float(os.getenv("SLIPPAGE_PCT",  "0.01"))  # cushion
+
+    # ---------- Maker trailing with panic fallback ----------
+    TRAIL_MAKER: bool = True                  # use maker limit for trailing exits
+    TRAIL_REPRICE_GAP_PCT: float = 0.01       # re-place limit if stop moved by ≥ this %
+    TRAIL_PANIC_PCT: float = 0.05             # if price crosses stop by this % → taker bail
+    TRAIL_PANIC_TIMEOUT_SEC: int = 2          # or if maker order sits unfilled ≥ this
 
     COOLDOWN_AFTER_TRADE_SEC: int = 14400
 
@@ -156,7 +163,6 @@ def setup_logging(level: str = "INFO"):
 log = setup_logging(S.LOG_LEVEL)
 
 # ---------------- Utils/TA ----------------
-from typing import NamedTuple
 def now_utc() -> datetime: return datetime.now(timezone.utc)
 def to_tz(dt: datetime, tz: str) -> datetime: return dt.astimezone(ZoneInfo(tz))
 def riyadh_now() -> datetime: return to_tz(now_utc(), S.TZ)
@@ -220,7 +226,7 @@ async def load_exchange_info(session: aiohttp.ClientSession):
         data = await r.json()
     filters = {}
     for s in data.get("symbols", []):
-        sym = s.get("symbol")
+        sym = s.get("symbol"); 
         if not sym: continue
         tick = step = min_qty = min_notional = None
         for f in s.get("filters", []):
@@ -666,8 +672,7 @@ def _rsi_dir_conf(sym:str)->Tuple[Optional[str], float, Optional[float]]:
         val = (r - S.RSI_HIGH) / max(1.0, 80.0 - S.RSI_HIGH); conf = max(0.0, min(1.0, val))
         return "LONG", conf, r
     elif r <= S.RSI_LOW:
-        val = (S.RSI_LOW - r) / max(1.0, S.SI_LOW - 20.0) if False else (S.RSI_LOW - r) / max(1.0, S.RSI_LOW - 20.0)
-        conf = max(0.0, min(1.0, val))
+        val = (S.RSI_LOW - r) / max(1.0, S.RSI_LOW - 20.0); conf = max(0.0, min(1.0, val))
         return "SHORT", conf, r
     else:
         return None, 0.0, r
@@ -723,6 +728,31 @@ LAST_ORDER = {"phase": None, "ok": None, "msg": None, "ts": None}
 def _ord_status(phase, ok, msg=None):
     global LAST_ORDER
     LAST_ORDER = {"phase": phase, "ok": ok, "msg": (msg or "")[:300], "ts": int(time.time())}
+
+def pct_to_mult(p: float) -> float:
+    """p is percent, e.g. 0.04 => 0.04% => 0.0004 multiplier."""
+    return p / 100.0
+
+def fee_cushion_pct(exit_kind: str) -> float:
+    """Total percent to cover entry taker + exit fee + slippage cushion."""
+    exit_fee = S.FEE_MAKER_PCT if exit_kind == "maker" else S.FEE_TAKER_PCT
+    return S.FEE_TAKER_PCT + exit_fee + S.SLIPPAGE_PCT
+
+def be_with_fees_pct(entry: float, side: str, exit_kind: str) -> float:
+    c = pct_to_mult(fee_cushion_pct(exit_kind))
+    return entry * (1 + c) if side == "LONG" else entry * (1 - c)
+
+async def place_reduceonly_limit(sym: str, side: str, limit_price: float, qty: float) -> Optional[int]:
+    """Maker reduceOnly LIMIT at price; returns orderId or None."""
+    if S.DRY_RUN: return None
+    px, q = quantize(sym, limit_price, qty)
+    kwargs = {"timeInForce": "GTC", "reduceOnly": True}
+    if _is_hedge(): kwargs["positionSide"] = _pos_side(side)
+    resp = await BINANCE_CLIENT.place_order(
+        sym, "SELL" if side == "LONG" else "BUY", "LIMIT",
+        price=f"{(px or limit_price):.10f}", quantity=f"{(q or qty):.10f}", **kwargs
+    )
+    return int(resp.get("orderId"))
 
 async def place_entry_and_brackets(sym: str, side: str, entry_price_ref: float, sl_price: float, tp_limit: Optional[float]):
     """
@@ -858,15 +888,15 @@ async def force_close_market(sym: str, side_hint: Optional[str]=None) -> Optiona
         raise RuntimeError(f"force_close failed; market_err={last_err} stop_err={str(e2)}")
 
 # ---------- PnL (after fees) ----------
-def pnl_after_fees(entry: float, exit_: float, side: str, risk: float, exit_fee_bps: float) -> Tuple[float,float]:
+def pnl_after_fees(entry: float, exit_: float, side: str, risk: float, exit_kind: str) -> Tuple[float,float]:
     """
-    Returns (net_pct, net_R) after subtracting entry taker fee and exit fee (maker/taker).
-    net_pct is relative to entry price (signed).
+    Returns (net_pct, net_R) after subtracting entry taker fee and exit fee (maker/taker) plus none (already applied via exit price).
     """
     if entry <= 0:
         return 0.0, 0.0
-    fee_entry = entry * (S.FEE_TAKER_BPS/10_000.0)
-    fee_exit  = exit_ * (exit_fee_bps/10_000.0)
+    fee_entry = entry * pct_to_mult(S.FEE_TAKER_PCT)
+    exit_fee_pct = S.FEE_MAKER_PCT if exit_kind == "maker" else S.FEE_TAKER_PCT
+    fee_exit  = exit_ * pct_to_mult(exit_fee_pct)
     gross = (exit_ - entry) if side=="LONG" else (entry - exit_)
     net = gross - (fee_entry + fee_exit)
     net_pct = (net / entry) * 100.0
@@ -967,7 +997,8 @@ async def on_kline(symbol:str, k:dict):
             "tp1_hit": False, "trail_active": True, "trail_peak": mid,
             "trail_dist": trail_dist, "atr_at_entry": atr_val,
             "time_stop": now_ts + int(min(max(S.TIME_STOP_SEC_MIN, 240), S.TIME_STOP_SEC_MAX)),
-            "order_ids": orders
+            "order_ids": orders,
+            "filled_qty": float(orders.get("qty", 0.0))
         }
         LAST_TRADE_TS[sym] = now_ts
         qty_txt = f"{orders.get('qty',0):.4f}" if not S.DRY_RUN else "—"
@@ -1001,7 +1032,8 @@ async def on_kline(symbol:str, k:dict):
         "risk": risk, "opened_ts": now_ts,
         "tp1_hit": False, "trail_active": False, "trail_peak": None,
         "trail_dist": atr_val * S.TRAIL_ATR_MULT, "atr_at_entry": atr_val,
-        "time_stop": None, "order_ids": orders
+        "time_stop": None, "order_ids": orders,
+        "filled_qty": float(orders.get("qty", 0.0))
     }
     LAST_TRADE_TS[sym] = now_ts
     sl_pct=_fmt_pct(sl, actual_entry); tp1_pct=_fmt_pct(tp1, actual_entry); tp2_pct=_fmt_pct(tp2, actual_entry)
@@ -1036,28 +1068,92 @@ async def on_bookticker(symbol:str, data:dict):
             if bid <= sl: await _close_trade(sym, "SL", bid, entry, trade["risk"]); return
             if ask >= tp1:
                 trade["tp1_hit"] = True; trade["trail_active"] = True; trade["trail_peak"] = mid
+                trade["be_fee"] = be_with_fees_pct(entry, side, exit_kind="taker")
         else:
             if ask >= sl: await _close_trade(sym, "SL", ask, entry, trade["risk"]); return
             if bid <= tp1:
                 trade["tp1_hit"] = True; trade["trail_active"] = True; trade["trail_peak"] = mid
+                trade["be_fee"] = be_with_fees_pct(entry, side, exit_kind="taker")
         return
 
+    # -------- Maker trailing with panic fallback --------
     if side == "LONG":
         if trade["trail_active"]:
-            tp = trade.get("trail_peak"); tp = mid if tp is None else max(tp, mid)
-            trade["trail_peak"] = tp
-            trail_stop = tp - trail_dist
-            if bid <= trail_stop:
-                await _close_trade(sym, "TS", trail_stop, entry, trade["risk"]); return
+            trade["trail_peak"] = max(trade.get("trail_peak") or mid, mid)
+            raw_trail_stop = trade["trail_peak"] - trail_dist
+            be_min = trade.get("be_fee", entry)
+            trail_stop = max(raw_trail_stop, be_min)
+            trade["trail_stop"] = trail_stop
+
+            if S.TRAIL_MAKER and not S.DRY_RUN:
+                qty = trade.get("filled_qty", 0.0)
+                if qty > 0:
+                    need_new = False
+                    last_px = trade.get("trail_order_px")
+                    gap = abs((trail_stop - (last_px or trail_stop)) / max(trail_stop, 1e-12)) * 100.0
+                    if trade.get("trail_order_id") is None or gap >= S.TRAIL_REPRICE_GAP_PCT:
+                        need_new = True
+                    if need_new and trade.get("trail_order_id"):
+                        try: await BINANCE_CLIENT.cancel_all(sym)
+                        except Exception: pass
+                        trade["trail_order_id"] = None; trade["trail_order_px"] = None
+                    if need_new:
+                        try:
+                            oid = await place_reduceonly_limit(sym, side, trail_stop, qty)
+                            trade["trail_order_id"] = oid; trade["trail_order_px"] = trail_stop
+                            trade["trail_order_since"] = time.time()
+                        except Exception:
+                            await _close_trade(sym, "TS", trail_stop, entry, trade["risk"]); return
+                    crossed = (bid <= trail_stop * (1 - pct_to_mult(S.TRAIL_PANIC_PCT)))
+                    aged = (time.time() - (trade.get("trail_order_since") or time.time())) >= S.TRAIL_PANIC_TIMEOUT_SEC
+                    if crossed or aged:
+                        try: await BINANCE_CLIENT.cancel_all(sym)
+                        except Exception: pass
+                        await _close_trade(sym, "TS", trail_stop, entry, trade["risk"]); return
+            else:
+                if bid <= trail_stop:
+                    await _close_trade(sym, "TS", trail_stop, entry, trade["risk"]); return
+
         if not S.CONSENSUS_ROUTER and tp2 and ask >= tp2:
             await _close_trade(sym, "TP2", tp2, entry, trade["risk"]); return
-    else:
+
+    else:  # SHORT
         if trade["trail_active"]:
-            tp = trade.get("trail_peak"); tp = mid if tp is None else min(tp, mid)
-            trade["trail_peak"] = tp
-            trail_stop = tp + trail_dist
-            if ask >= trail_stop:
-                await _close_trade(sym, "TS", trail_stop, entry, trade["risk"]); return
+            trade["trail_peak"] = min(trade.get("trail_peak") or mid, mid)
+            raw_trail_stop = trade["trail_peak"] + trail_dist
+            be_max = trade.get("be_fee", entry)
+            trail_stop = min(raw_trail_stop, be_max)
+            trade["trail_stop"] = trail_stop
+
+            if S.TRAIL_MAKER and not S.DRY_RUN:
+                qty = trade.get("filled_qty", 0.0)
+                if qty > 0:
+                    need_new = False
+                    last_px = trade.get("trail_order_px")
+                    gap = abs((trail_stop - (last_px or trail_stop)) / max(trail_stop, 1e-12)) * 100.0
+                    if trade.get("trail_order_id") is None or gap >= S.TRAIL_REPRICE_GAP_PCT:
+                        need_new = True
+                    if need_new and trade.get("trail_order_id"):
+                        try: await BINANCE_CLIENT.cancel_all(sym)
+                        except Exception: pass
+                        trade["trail_order_id"] = None; trade["trail_order_px"] = None
+                    if need_new:
+                        try:
+                            oid = await place_reduceonly_limit(sym, side, trail_stop, qty)
+                            trade["trail_order_id"] = oid; trade["trail_order_px"] = trail_stop
+                            trade["trail_order_since"] = time.time()
+                        except Exception:
+                            await _close_trade(sym, "TS", trail_stop, entry, trade["risk"]); return
+                    crossed = (ask >= trail_stop * (1 + pct_to_mult(S.TRAIL_PANIC_PCT)))
+                    aged = (time.time() - (trade.get("trail_order_since") or time.time())) >= S.TRAIL_PANIC_TIMEOUT_SEC
+                    if crossed or aged:
+                        try: await BINANCE_CLIENT.cancel_all(sym)
+                        except Exception: pass
+                        await _close_trade(sym, "TS", trail_stop, entry, trade["risk"]); return
+            else:
+                if ask >= trail_stop:
+                    await _close_trade(sym, "TS", trail_stop, entry, trade["risk"]); return
+
         if not S.CONSENSUS_ROUTER and tp2 and bid <= tp2:
             await _close_trade(sym, "TP2", tp2, entry, trade["risk"]); return
 
@@ -1102,11 +1198,10 @@ async def _close_trade(symbol: str, outcome: str, exit_price: float, entry: floa
             exchange_closed = False
             close_err = str(e)
 
-    # Exit fee bps (TP2=maker, TS/SL=taker)
-    exit_fee_bps = S.FEE_MAKER_BPS if outcome == "TP2" else S.FEE_TAKER_BPS
-    net_pct, net_R = pnl_after_fees(entry, actual_exit, trade["side"], risk, exit_fee_bps)
-    pl_pct = net_pct
-    R = net_R
+    # Exit kind for fee calc
+    exit_kind = "maker" if outcome == "TP2" else "taker"
+    net_pct, net_R = pnl_after_fees(entry, actual_exit, trade["side"], risk, exit_kind)
+    pl_pct = net_pct; R = net_R
 
     dur_min = (int(time.time()) - trade["opened_ts"]) / 60.0
     status_emoji = "✅" if exchange_closed or S.DRY_RUN else "⚠️"
@@ -1117,7 +1212,7 @@ async def _close_trade(symbol: str, outcome: str, exit_price: float, entry: floa
            f"Outcome: <b>{outcome}</b>\n"
            f"Entry: {entry:.6f} → Exit: {actual_exit:.6f}  (PnL net: {pl_pct:+.2f}% | {R:+.2f}R)\n"
            f"TP1 hit: {'✅' if trade.get('tp1_hit') else '—'}\n"
-           f"Fees (bps): taker {S.FEE_TAKER_BPS:.2f}, maker {S.FEE_MAKER_BPS:.2f}\n"
+           f"Fees (%): taker {S.FEE_TAKER_PCT:.3f}, maker {S.FEE_MAKER_PCT:.3f}, slip {S.SLIPPAGE_PCT:.3f}\n"
            f"Duration: {dur_min:.1f} min{extra}")
     await alert(msg, symbol)
     _log_event({"ts": int(time.time()), "type": "result", "symbol": symbol, "outcome": outcome, "entry": entry, "exit": actual_exit, "pnl_pct_net": pl_pct, "R_net": R, "tp1_hit": trade.get('tp1_hit'), "exchange_closed": exchange_closed, "close_err": close_err})
