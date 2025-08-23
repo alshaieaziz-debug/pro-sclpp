@@ -1,15 +1,17 @@
-# app.py — Binance USDT-M Scalper (MARKET entries first, then Telegram alert)
+# app.py — Binance USDT-M Scalper (ENTER FIRST → then alert; robust orders/closes)
 # ✅ Signals: Breakout + body, Quick Retest, Sweep/Reclaim, HTF(15m) bias gating 5m
 # ✅ Flow: CVD slope, Liquidity wall avoidance, Quote-volume Z
 # ✅ OI: relaxed z/Δ% with last-step slope
 # ✅ Risk: R:R=1:2 (TP1, TP2), TRAIL only after TP1 (orig). Router uses TP1 + trail.
 # ✅ Ops: 4h cooldown, Daily stats (22:00 Riyadh), /healthz, Telegram
-# ✅ Change requested:
-#    - ENTER FIRST (MARKET) → place SL/TP on Binance → then send Telegram alert (no gating).
-#    - SL uses STOP-MARKET with reduceOnly + closePosition=True for robustness.
-#    - Precision quantization for qty/price using exchangeInfo (tickSize/stepSize/mins).
-#    - Fix RSI confidence clamp bug in consensus router.
-#    - Reuse global REST_SESSION for Telegram.
+# ✅ Fixes:
+#    - ENTER first → place SL/TP → then send EXECUTED (or FAILED).
+#    - DRY_RUN: alerts always; exchange calls only when False.
+#    - Telegram: per-send session + retry; last_telegram in /healthz.
+#    - Binance: time sync + recvWindow; precision quantizer (tick/step/mins).
+#    - SL: STOP_MARKET closePosition (no reduceOnly). TP: LIMIT reduceOnly qty.
+#    - Trailing: peak init + bid/ask checks + None guards.
+#    - force_close: quantized qty + retry + STOP_MARKET fallback; verify flat.
 
 import sys, subprocess, os
 def _ensure(pkgs):
@@ -98,7 +100,6 @@ class Settings(BaseSettings):
     # Telegram
     TELEGRAM_BOT_TOKEN: Optional[str] = None
     TELEGRAM_CHAT_ID: Optional[str] = None
-    TELEGRAM_TIMEOUT_MS: int = 500  # soft timeout; we alert AFTER entry so no gating
 
     # Server
     HOST: str = "0.0.0.0"
@@ -173,7 +174,6 @@ def setup_logging(level: str = "INFO"):
 log = setup_logging(S.LOG_LEVEL)
 
 # ---------------- Utils/TA ----------------
-from typing import NamedTuple
 def now_utc() -> datetime: return datetime.now(timezone.utc)
 def to_tz(dt: datetime, tz: str) -> datetime: return dt.astimezone(ZoneInfo(tz))
 def riyadh_now() -> datetime: return to_tz(now_utc(), S.TZ)
@@ -268,11 +268,10 @@ def quantize(symbol: str, price: Optional[float]=None, qty: Optional[float]=None
     return out_p, out_q
 
 async def discover_perp_usdt_symbols(session: aiohttp.ClientSession, max_symbols:int) -> List[str]:
-    # We already loaded exchangeInfo above; reuse FILTERS
-    out=[]
     async with session.get(f"{BASE_REST}/fapi/v1/exchangeInfo") as r:
         r.raise_for_status()
         data = await r.json()
+    out=[]
     for s in data.get("symbols", []):
         try:
             if s.get("contractType")=="PERPETUAL" and s.get("quoteAsset")=="USDT" and s.get("status")=="TRADING":
@@ -288,10 +287,20 @@ class BinanceClient:
         self.session = session
         self.key = S.BINANCE_API_KEY
         self.secret = (S.BINANCE_API_SECRET or "").encode()
+        self.time_offset_ms = 0
+
+    async def sync_time(self):
+        async with self.session.get(f"{BASE_REST}/fapi/v1/time") as r:
+            r.raise_for_status()
+            srv = await r.json()
+        self.time_offset_ms = int(srv["serverTime"]) - int(time.time()*1000)
 
     async def _signed(self, method: str, path: str, params: Dict[str, Any] | None = None):
         if params is None: params = {}
-        params["timestamp"] = int(time.time()*1000)
+        if abs(self.time_offset_ms) > 5000:
+            await self.sync_time()
+        params["timestamp"] = int(time.time()*1000) + self.time_offset_ms
+        params.setdefault("recvWindow", 5000)
         q = urllib.parse.urlencode(params, doseq=True)
         sig = hmac.new(self.secret, q.encode(), hashlib.sha256).hexdigest()
         headers = {"X-MBX-APIKEY": self.key} if self.key else {}
@@ -515,29 +524,39 @@ class BreakoutEngine:
                       sweep_reclaim=sr, atr_val=atr_val, htf_bias_ok=True)
 
 # ------------- Telegram -------------
+LAST_TELEGRAM = {"ok": None, "status": None, "error": None, "ts": None}
 class Telegram:
-    def __init__(self, token:str, chat_id:str, session:aiohttp.ClientSession|None):
-        self.api=f"https://api.telegram.org/bot{token}" if token else None
-        self.chat_id=chat_id
-        self.session = session
-    async def send(self, text:str) -> bool:
-        if not self.api or not self.chat_id or not self.session:
-            log.info("alert", text=text)  # DRY or no creds → log only
+    def __init__(self, token: str, chat_id: str):
+        self.api = f"https://api.telegram.org/bot{token}" if token else None
+        self.chat_id = chat_id
+    async def send(self, text: str) -> bool:
+        global LAST_TELEGRAM
+        ts = int(time.time())
+        if not self.api or not self.chat_id:
+            LAST_TELEGRAM = {"ok": True, "status": "NO_CREDS", "error": None, "ts": ts}
+            log.info("alert", text=text)
             return True
-        try:
-            # soft timeout
-            async with self.session.post(
-                f"{self.api}/sendMessage",
-                json={"chat_id": self.chat_id, "text": text, "parse_mode":"HTML", "disable_web_page_preview": True},
-                timeout=aiohttp.ClientTimeout(total=max(0.05, S.TELEGRAM_TIMEOUT_MS/1000.0))
-            ) as r:
-                if r.status!=200:
-                    log.warning("telegram_err", status=r.status, body=await r.text())
-                    return False
-                return True
-        except Exception as e:
-            log.warning("telegram_exc", error=str(e))
-            return False
+        payload = {"chat_id": self.chat_id, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
+        for attempt in (1, 2):
+            try:
+                async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5)) as s:
+                    async with s.post(f"{self.api}/sendMessage", json=payload) as r:
+                        body = await r.text()
+                        if r.status == 200:
+                            LAST_TELEGRAM = {"ok": True, "status": 200, "error": None, "ts": ts}
+                            return True
+                        LAST_TELEGRAM = {"ok": False, "status": r.status, "error": body[:300], "ts": ts}
+                        log.warning("telegram_err", status=r.status, body=body)
+            except Exception as e:
+                LAST_TELEGRAM = {"ok": False, "status": "EXC", "error": str(e), "ts": ts}
+                log.warning("telegram_exc", error=str(e))
+            await asyncio.sleep(0.2)
+        return False
+
+async def alert(text:str, symbol:str) -> bool:
+    STATE["last_alert"]={"symbol":symbol,"text":text,"ts":int(time.time())}
+    tg = Telegram(S.TELEGRAM_BOT_TOKEN or "", S.TELEGRAM_CHAT_ID or "")
+    return await tg.send(text)
 
 # ------------- Diagnostics (drop reasons) -------------
 TRACE_DECISIONS = S.TRACE_DECISIONS
@@ -566,6 +585,8 @@ class HealthServer:
             "uptime_sec":int(time.time()-self.state.get("start_time",time.time())),
             "last_kline":self.state.get("last_kline",{}),
             "last_alert":self.state.get("last_alert",{}),
+            "last_telegram": LAST_TELEGRAM,
+            "last_order": LAST_ORDER,
             "symbols":self.state.get("symbols",[]),
             "timeframes":self.state.get("timeframes",[]),
             "open_trades": list(OPEN_TRADES.keys()),
@@ -674,12 +695,10 @@ def _rsi_dir_conf(sym:str)->Tuple[Optional[str], float, Optional[float]]:
     r = rsi(list(b["c"]), S.RSI_LEN)
     if r is None: return None, 0.0, None
     if r >= S.RSI_HIGH:
-        val = (r - S.RSI_HIGH) / max(1.0, 80.0 - S.RSI_HIGH)
-        conf = max(0.0, min(1.0, val))
+        val = (r - S.RSI_HIGH) / max(1.0, 80.0 - S.RSI_HIGH); conf = max(0.0, min(1.0, val))
         return "LONG", conf, r
     elif r <= S.RSI_LOW:
-        val = (S.RSI_LOW - r) / max(1.0, S.RSI_LOW - 20.0)
-        conf = max(0.0, min(1.0, val))
+        val = (S.RSI_LOW - r) / max(1.0, S.RSI_LOW - 20.0); conf = max(0.0, min(1.0, val))
         return "SHORT", conf, r
     else:
         return None, 0.0, r
@@ -688,7 +707,7 @@ def _pmm_imbalance(sym:str)->Optional[float]:
     if not top: return None
     den = (top.bid_qty + top.ask_qty)
     if den <= 0: return None
-    return float(top.bid_qty / den)  # 0..1 (buy-side share)
+    return float(top.bid_qty / den)
 def _grid_aligned(price: float, step_bp: float, side: str) -> bool:
     if step_bp <= 0: return False
     step = step_bp/10_000.0
@@ -696,7 +715,7 @@ def _grid_aligned(price: float, step_bp: float, side: str) -> bool:
     dist = abs(price - grid)
     return (dist <= price*step*0.15)
 
-# ----------- Execution helpers (market entry + brackets; force-close) -----------
+# ----------- Execution helpers -----------
 async def compute_qty(symbol: str, entry: float, sl: float) -> float:
     risk = abs(entry - sl)
     if risk <= 0: return 0.0
@@ -707,18 +726,21 @@ async def compute_qty(symbol: str, entry: float, sl: float) -> float:
     if not eq: eq = 1000.0
     risk_cash = eq * (S.MAX_RISK_PCT/100.0)
     qty = risk_cash / risk
-    # notional cap
     if S.NOTIONAL_MAX_PCT and S.NOTIONAL_MAX_PCT > 0:
         max_notional = eq * (S.NOTIONAL_MAX_PCT/100.0) * float(S.LEVERAGE)
         qty = min(qty, max_notional / max(entry,1e-9))
-    # quantize & floor to stepSize
     _, q = quantize(symbol, None, qty)
     return max(q or 0.0, 0.0)
 
+LAST_ORDER = {"phase": None, "ok": None, "msg": None, "ts": None}
+def _ord_status(phase, ok, msg=None):
+    global LAST_ORDER
+    LAST_ORDER = {"phase": phase, "ok": ok, "msg": (msg or "")[:300], "ts": int(time.time())}
+
 async def place_entry_and_brackets(sym: str, side: str, entry_price_ref: float, sl_price: float, tp_limit: Optional[float]):
     """
-    MARKET enter fast. Immediately place reduceOnly SL (STOP_MARKET, closePosition) and TP (LIMIT reduceOnly).
-    Returns dict with order ids + qty. DRY_RUN returns placeholder ids.
+    ENTER FIRST: MARKET → SL STOP_MARKET closePosition → TP LIMIT reduceOnly.
+    Returns dict with order ids + qty. DRY_RUN returns placeholders.
     """
     if S.DRY_RUN:
         return {"entryId": None, "slId": None, "tpId": None, "qty": 0.0}
@@ -729,59 +751,109 @@ async def place_entry_and_brackets(sym: str, side: str, entry_price_ref: float, 
         raise RuntimeError(f"Computed quantity too small: {qty}")
 
     # ENTRY: MARKET
-    entry_resp = await BINANCE_CLIENT.place_order(
-        sym, "BUY" if side=="LONG" else "SELL", "MARKET",
-        quantity=f"{qty:.10f}"
-    )
+    try:
+        entry_resp = await BINANCE_CLIENT.place_order(
+            sym, "BUY" if side=="LONG" else "SELL", "MARKET",
+            quantity=f"{qty:.10f}"
+        )
+        _ord_status("ENTRY", True)
+    except Exception as e:
+        _ord_status("ENTRY", False, str(e))
+        raise
     entry_id = entry_resp.get("orderId")
 
-    # SL: STOP_MARKET reduceOnly + closePosition (safer than qty, handles partials)
-    sl_qp, _ = quantize(sym, sl_price, None)
-    sl_resp = await BINANCE_CLIENT.place_order(
-        sym, "SELL" if side=="LONG" else "BUY", "STOP_MARKET",
-        stopPrice=f"{(sl_qp or sl_price):.10f}",
-        reduceOnly=True, workingType=S.SL_WORKING_TYPE, closePosition=True
-    )
+    # SL: STOP_MARKET closePosition (robust)
+    sl_p, _ = quantize(sym, sl_price, None)
+    try:
+        sl_resp = await BINANCE_CLIENT.place_order(
+            sym, "SELL" if side=="LONG" else "BUY", "STOP_MARKET",
+            stopPrice=f"{(sl_p or sl_price):.10f}",
+            workingType=S.SL_WORKING_TYPE,
+            closePosition=True
+        )
+        _ord_status("SL", True)
+    except Exception as e:
+        _ord_status("SL", False, str(e))
+        raise
     sl_id = sl_resp.get("orderId")
 
-    # TP: LIMIT reduceOnly with explicit quantity
+    # TP: LIMIT reduceOnly with qty
     tp_id = None
     if tp_limit is not None:
         tp_p, _ = quantize(sym, tp_limit, None)
-        tp_resp = await BINANCE_CLIENT.place_order(
-            sym, "SELL" if side=="LONG" else "BUY", "LIMIT",
-            price=f"{(tp_p or tp_limit):.10f}", timeInForce="GTC",
-            quantity=f"{qty:.10f}", reduceOnly=True
-        )
-        tp_id = tp_resp.get("orderId")
+        try:
+            tp_resp = await BINANCE_CLIENT.place_order(
+                sym, "SELL" if side=="LONG" else "BUY", "LIMIT",
+                price=f"{(tp_p or tp_limit):.10f}", timeInForce="GTC",
+                quantity=f"{qty:.10f}", reduceOnly=True
+            )
+            _ord_status("TP", True)
+            tp_id = tp_resp.get("orderId")
+        except Exception as e:
+            _ord_status("TP", False, str(e))
+            raise
 
     return {"entryId": entry_id, "slId": sl_id, "tpId": tp_id, "qty": qty}
 
 async def force_close_market(sym: str) -> Optional[dict]:
     """
-    Market-flat the position on Binance, then cancel leftovers. ONE_WAY compatible.
+    Market-flat the position. Robust:
+      - quantizes qty to stepSize
+      - retries MARKET reduceOnly
+      - fallback STOP_MARKET closePosition on MARK_PRICE
     """
-    if S.DRY_RUN: return None
+    if S.DRY_RUN:
+        return None
+
     pos = await BINANCE_CLIENT.get_position_risk(sym)
     if not pos:
         try: await BINANCE_CLIENT.cancel_all(sym)
         except Exception: pass
         return None
-    amt = float(pos.get("positionAmt", "0"))
-    if abs(amt) < 1e-9:
+
+    raw_amt = float(pos.get("positionAmt", "0") or "0")
+    if abs(raw_amt) < 1e-12:
         try: await BINANCE_CLIENT.cancel_all(sym)
         except Exception: pass
         return None
-    side = "SELL" if amt > 0 else "BUY"
-    qty = abs(amt)
+
+    side = "SELL" if raw_amt > 0 else "BUY"
+    step = (FILTERS.get(sym, {}) or {}).get("stepSize", 0.001) or 0.001
+    q = math.floor(abs(raw_amt) / step) * step
+    if q <= 0: q = step
+
+    last_err = None
+    for attempt in range(3):
+        try:
+            resp = await BINANCE_CLIENT.place_order(
+                sym, side, "MARKET", quantity=f"{q:.10f}", reduceOnly=True
+            )
+            return resp
+        except Exception as e:
+            last_err = str(e)
+            await asyncio.sleep(0.2 * (attempt + 1))
+
+    # Fallback STOP_MARKET closePosition on MARK_PRICE
     try:
+        top = OB.top(sym)
+        ref = (top.bid_price if side == "SELL" else top.ask_price) if top else None
+        sp, _ = quantize(sym, ref or 0.0, None)
         resp = await BINANCE_CLIENT.place_order(
-            sym, side, "MARKET", quantity=f"{qty:.10f}", reduceOnly=True
+            sym, side, "STOP_MARKET",
+            stopPrice=f"{(sp or ref or 0.0):.10f}",
+            workingType="MARK_PRICE",
+            closePosition=True
         )
-    finally:
-        try: await BINANCE_CLIENT.cancel_all(sym)
-        except Exception: pass
-    return resp
+        return resp
+    except Exception as e2:
+        raise RuntimeError(f"force_close failed; market_err={last_err} stop_err={str(e2)}")
+
+async def place_entry_and_brackets_safe(sym, side, entry_price_ref, sl_price, tp_limit):
+    try:
+        out = await place_entry_and_brackets(sym, side, entry_price_ref, sl_price, tp_limit)
+        return out, None
+    except Exception as e:
+        return None, str(e)[:500]
 
 # ------------- Handlers -----------
 async def on_kline(symbol:str, k:dict):
@@ -789,7 +861,6 @@ async def on_kline(symbol:str, k:dict):
     def _f(x): 
         try: return float(x)
         except: return 0.0
-    # QUOTE volume in WS kline is 'q'
     cndl=Candle(int(k["t"]), _f(k["o"]), _f(k["h"]), _f(k["l"]), _f(k["c"]), _f(k.get("q", 0.0)), int(k["T"]))
     BE.add_candle(sym, tf, cndl)
     STATE["last_kline"]={"symbol":sym,"tf":tf,"t":k["T"]}
@@ -799,7 +870,7 @@ async def on_kline(symbol:str, k:dict):
         _maybe_debug_drop(sym, tf, "no_candidate", {"close": cndl.close})
         return
 
-    # HTF bias (15m SMA + slope gate for 5m)
+    # HTF bias (15m) for 5m
     if tf=="5m":
         buf=BE.buffers.get((sym,"15m"))
         if buf and len(buf["c"])>=S.HTF_SMA_LEN:
@@ -815,7 +886,7 @@ async def on_kline(symbol:str, k:dict):
         else:
             sig.htf_bias_ok=True
 
-    # Volume Z-score (quote)
+    # Volume Z-score
     buf=BE.buffers.get((sym,tf))
     vol_z = 0.0
     if buf and len(buf["v"])>=30:
@@ -827,7 +898,7 @@ async def on_kline(symbol:str, k:dict):
         _maybe_debug_drop(sym, tf, "vol_z_low", {"vol_z": round(vol_z,3), "min": S.VOL_Z_MIN})
         return
 
-    # OI relaxed check
+    # OI check
     if not await fetch_oi_relaxed_ok(sym, sig.side):
         _maybe_debug_drop(sym, tf, "oi_block", {"side": sig.side})
         return
@@ -845,36 +916,11 @@ async def on_kline(symbol:str, k:dict):
     else:
         slope = 0.0
 
-    # Liquidity wall avoidance
+    # Liquidity walls
     if S.ENABLE_WALLS and DEP:
         ref = sig.level * (1+S.BREAKOUT_PAD_BP/10_000) if sig.side=="LONG" else sig.level*(1-S.BREAKOUT_PAD_BP/10_000)
         if DEP.has_opposite_wall(sym, sig.side, ref, S.WALL_BAND_BP, S.WALL_MULT):
             _maybe_debug_drop(sym, tf, "wall_block", {"ref": round(ref,6), "band_bp": S.WALL_BAND_BP, "mult": S.WALL_MULT})
-            return
-
-    # ------------- Consensus Router (optional) -------------
-    if S.CONSENSUS_ROUTER:
-        # Quality gates
-        sp = _spread_bps(sym)
-        if sp is None or sp > S.SPREAD_BPS_MAX:
-            _maybe_debug_drop(sym, tf, "spread_gate", {"spread_bps": round(sp or -1,2), "max": S.SPREAD_BPS_MAX})
-            return
-        a1 = _atr1m_bps(sym)
-        if a1 is None or a1 < S.ATR1M_MIN_BPS or a1 > S.ATR1M_MAX_BPS:
-            _maybe_debug_drop(sym, tf, "atr1m_gate", {"atr1m_bps": round(a1 or -1,2), "min": S.ATR1M_MIN_BPS, "max": S.ATR1M_MAX_BPS})
-            return
-        if OB.top(sym) is None or DEP.last_depth.get(sym) is None:
-            _maybe_debug_drop(sym, tf, "data_gate", {})
-            return
-
-        # Trigger rule: BR & RSI must agree + confidences
-        rsi_dir, rsi_conf, rsi_val = _rsi_dir_conf(sym)
-        if rsi_dir is None or rsi_dir != sig.side:
-            _maybe_debug_drop(sym, tf, "rsi_disagree", {"side": sig.side, "rsi_dir": rsi_dir, "rsi": rsi_val})
-            return
-        br_conf = max(0.0, min(1.0, (sig.body_ratio - S.BODY_RATIO_MIN) / max(1e-6, 1.0 - S.BODY_RATIO_MIN)))
-        if rsi_conf < S.CONS_MIN or br_conf < S.CONS_MIN:
-            _maybe_debug_drop(sym, tf, "conf_low", {"rsi_conf": round(rsi_conf,2), "br_conf": round(br_conf,2), "min": S.CONS_MIN})
             return
 
     # Cooldown / duplicate
@@ -888,72 +934,94 @@ async def on_kline(symbol:str, k:dict):
 
     # ---------- Build plan ----------
     top = OB.top(sym)
-    mid = (top.ask_price + top.bid_price)/2.0 if top else sig.price
+    bid = top.bid_price if top else sig.price
+    ask = top.ask_price if top else sig.price
+    mid = (bid + ask)/2.0
     atr_val = sig.atr_val if sig.atr_val and sig.atr_val>0 else (sig.price*0.003)
     pad = S.BREAKOUT_PAD_BP / 10_000
 
+    # ------------- Consensus Router -------------
     if S.CONSENSUS_ROUTER:
-        entry = sig.level * (1 + pad) if sig.side=="LONG" else sig.level * (1 - pad)
-        sl = from_bps(S.SL_BPS, entry, sig.side, -1 if sig.side=="LONG" else +1)
-        tp1 = from_bps(S.TP1_BPS, entry, sig.side, +1 if sig.side=="LONG" else -1)
-        a1 = _atr1m_bps(sym) or 10.0
-        trail_dist = (a1/10_000.0) * mid * S.TRAIL_ATR1M_MULT
-        risk = abs(entry - sl)
-
-        # 1) MARKET ENTER + BRACKETS (first)
-        try:
-            orders = await place_entry_and_brackets(sym=sym, side=sig.side, entry_price_ref=entry, sl_price=sl, tp_limit=tp1)
-        except Exception as e:
-            log.error("order_error", symbol=sym, error=str(e))
+        sp = _spread_bps(sym)
+        if sp is None or sp > S.SPREAD_BPS_MAX:
+            _maybe_debug_drop(sym, tf, "spread_gate", {"spread_bps": round(sp or -1,2), "max": S.SPREAD_BPS_MAX})
+            return
+        a1 = _atr1m_bps(sym)
+        if a1 is None or a1 < S.ATR1M_MIN_BPS or a1 > S.ATR1M_MAX_BPS:
+            _maybe_debug_drop(sym, tf, "atr1m_gate", {"atr1m_bps": round(a1 or -1,2), "min": S.ATR1M_MIN_BPS, "max": S.ATR1M_MAX_BPS})
+            return
+        if OB.top(sym) is None or DEP.last_depth.get(sym) is None:
+            _maybe_debug_drop(sym, tf, "data_gate", {})
+            return
+        rsi_dir, rsi_conf, rsi_val = _rsi_dir_conf(sym)
+        if rsi_dir is None or rsi_dir != sig.side:
+            _maybe_debug_drop(sym, tf, "rsi_disagree", {"side": sig.side, "rsi_dir": rsi_dir, "rsi": rsi_val})
+            return
+        br_conf = max(0.0, min(1.0, (sig.body_ratio - S.BODY_RATIO_MIN) / max(1e-6, 1.0 - S.BODY_RATIO_MIN)))
+        if rsi_conf < S.CONS_MIN or br_conf < S.CONS_MIN:
+            _maybe_debug_drop(sym, tf, "conf_low", {"rsi_conf": round(rsi_conf,2), "br_conf": round(br_conf,2), "min": S.CONS_MIN})
             return
 
-        # 2) Record locally
+        entry = sig.level * (1 + pad) if sig.side=="LONG" else sig.level * (1 - pad)
+        sl    = from_bps(S.SL_BPS, entry, sig.side, -1 if sig.side=="LONG" else +1)
+        tp1   = from_bps(S.TP1_BPS, entry, sig.side, +1 if sig.side=="LONG" else -1)
+        a1    = _atr1m_bps(sym) or 10.0
+        trail_dist = (a1/10_000.0) * mid * S.TRAIL_ATR1M_MULT
+        risk  = abs(entry - sl)
+
+        # ENTER FIRST
+        orders, err = await place_entry_and_brackets_safe(sym=sym, side=sig.side,
+                                                          entry_price_ref=entry, sl_price=sl, tp_limit=tp1)
+        if err:
+            await alert(
+                f"🚫 ORDER FAILED (Router) {sym} {tf}\n"
+                f"{sig.side} entry≈{entry:.6f} SL≈{sl:.6f} TP1≈{tp1:.6f}\nErr: {err}", sym)
+            return
+
         OPEN_TRADES[sym] = {
             "symbol": sym, "side": sig.side, "tf": tf,
-            "entry": entry, "sl": sl, "tp1": tp1, "tp2": None,  # router uses TP1 + trail
-            "risk": risk,
-            "opened_ts": now_ts,
-            "tp1_hit": False, "trail_active": True, "trail_peak": None,
+            "entry": entry, "sl": sl, "tp1": tp1, "tp2": None,
+            "risk": risk, "opened_ts": now_ts,
+            "tp1_hit": False, "trail_active": True, "trail_peak": mid,
             "trail_dist": trail_dist, "atr_at_entry": atr_val,
             "time_stop": now_ts + int(min(max(S.TIME_STOP_SEC_MIN, 240), S.TIME_STOP_SEC_MAX)),
             "order_ids": orders
         }
         LAST_TRADE_TS[sym] = now_ts
 
-        # 3) ALERT after execution (non-gating)
         qty_txt = f"{orders.get('qty',0):.4f}" if not S.DRY_RUN else "—"
         await alert(
             f"🛒 EXECUTED (Router) {sym} {tf}\n"
             f"Entry: <b>{entry:.6f}</b> | SL: <b>{sl:.6f}</b> | TP1: <b>{tp1:.6f}</b>\n"
             f"Qty: {qty_txt}\n"
-            f"VolZ: {vol_z:.2f}  CVD slope: {slope:.4f}  HTF: {'✅' if sig.htf_bias_ok else '❌'}  Sweep: {'✅' if sig.sweep_reclaim else '—'}",
+            f"VolZ: {vol_z:.2f}  CVD: {slope:.4f}  HTF:{'✅' if sig.htf_bias_ok else '❌'} Sweep:{'✅' if sig.sweep_reclaim else '—'}",
             sym
         )
         _log_event({"ts": now_ts, "type": "signal_consensus", "symbol": sym, "side": sig.side, "entry": entry, "sl": sl, "tp1": tp1})
         return
 
-    # ------- Original (R:R=1:2) path -------
-    entry = sig.price  # use signal close as reference; actual MARKET executes at book price
-    sl = entry - atr_val * S.ATR_SL_MULT if sig.side=="LONG" else entry + atr_val * S.ATR_SL_MULT
-    risk = abs(entry - sl)
+    # ------------- Original (R:R = 1:2) -------------
+    entry = sig.price
+    sl    = entry - atr_val * S.ATR_SL_MULT if sig.side=="LONG" else entry + atr_val * S.ATR_SL_MULT
+    risk  = abs(entry - sl)
     if risk <= 0: 
         _maybe_debug_drop(sym, tf, "zero_risk", {}); return
-    tp1 = entry + risk if sig.side=="LONG" else entry - risk
-    tp2 = entry + 2*risk if sig.side=="LONG" else entry - 2*risk
+    tp1   = entry + risk if sig.side=="LONG" else entry - risk
+    tp2   = entry + 2*risk if sig.side=="LONG" else entry - 2*risk
 
-    # 1) MARKET ENTER + BRACKETS (first; TP2 on exchange per original)
-    try:
-        orders = await place_entry_and_brackets(sym=sym, side=sig.side, entry_price_ref=entry, sl_price=sl, tp_limit=tp2)
-    except Exception as e:
-        log.error("order_error", symbol=sym, error=str(e))
+    # ENTER FIRST
+    orders, err = await place_entry_and_brackets_safe(sym=sym, side=sig.side,
+                                                      entry_price_ref=entry, sl_price=sl, tp_limit=tp2)
+    if err:
+        await alert(
+            f"🚫 ORDER FAILED {sym} {tf}\n"
+            f"{sig.side} entry≈{entry:.6f} SL≈{sl:.6f} TP2≈{tp2:.6f}\nErr: {err}", sym)
         return
 
-    # 2) Record locally
     OPEN_TRADES[sym] = {
         "symbol": sym, "side": sig.side, "tf": tf,
         "entry": entry, "sl": sl, "tp1": tp1, "tp2": tp2,
-        "risk": risk,
-        "opened_ts": now_ts,
+        "risk": risk, "opened_ts": now_ts,
         "tp1_hit": False, "trail_active": False, "trail_peak": None,
         "trail_dist": atr_val * S.TRAIL_ATR_MULT, "atr_at_entry": atr_val,
         "time_stop": None,
@@ -961,7 +1029,6 @@ async def on_kline(symbol:str, k:dict):
     }
     LAST_TRADE_TS[sym] = now_ts
 
-    # 3) ALERT after execution (non-gating)
     sl_pct=_fmt_pct(sl, entry); tp1_pct=_fmt_pct(tp1, entry); tp2_pct=_fmt_pct(tp2, entry)
     qty_txt = f"{orders.get('qty',0):.4f}" if not S.DRY_RUN else "—"
     await alert(
@@ -969,7 +1036,7 @@ async def on_kline(symbol:str, k:dict):
         f"Entry: <b>{entry:.6f}</b>\n"
         f"SL: <b>{sl:.6f}</b> ({sl_pct:+.2f}%) | TP1: <b>{tp1:.6f}</b> ({tp1_pct:+.2f}%) | TP2: <b>{tp2:.6f}</b> ({tp2_pct:+.2f}%)\n"
         f"Qty: {qty_txt}\n"
-        f"VolZ: {vol_z:.2f}  CVD slope: {slope:.4f}  HTF: {'✅' if sig.htf_bias_ok else '❌'}  Sweep: {'✅' if sig.sweep_reclaim else '—'}",
+        f"VolZ: {vol_z:.2f}  CVD: {slope:.4f}  HTF:{'✅' if sig.htf_bias_ok else '❌'} Sweep:{'✅' if sig.sweep_reclaim else '—'}",
         sym
     )
     _log_event({"ts": now_ts, "type": "signal", "symbol": sym, "side": sig.side, "entry": entry, "sl": sl, "tp1": tp1, "tp2": tp2})
@@ -981,44 +1048,50 @@ async def on_bookticker(symbol:str, data:dict):
     if not trade: return
     top = OB.top(sym)
     if not top: return
-    mid = (top.ask_price + top.bid_price) / 2
+    bid = top.bid_price; ask = top.ask_price
+    mid = (ask + bid) / 2
     if mid <= 0: return
+
     side = trade["side"]
     entry = trade["entry"]; sl = trade["sl"]; tp1 = trade["tp1"]; tp2 = trade["tp2"]
     trail_dist = trade["trail_dist"]
 
-    # Time stop (router mode)
+    # Time stop (router mode) before TP1
     if S.CONSENSUS_ROUTER and trade.get("time_stop") and int(time.time()) >= trade["time_stop"] and not trade["tp1_hit"]:
         await _close_trade(sym, "TS", mid, entry, trade["risk"]); return
 
-    # Before TP1: watch SL/TP1 locally (exchange SL/TP likely fill first but this is fine)
+    # Before TP1: SL/TP1 checks
     if not trade["tp1_hit"]:
         if side == "LONG":
-            if mid <= sl: await _close_trade(sym, "SL", mid, entry, trade["risk"]); return
-            if mid >= tp1:
+            if bid <= sl: await _close_trade(sym, "SL", bid, entry, trade["risk"]); return
+            if ask >= tp1:
                 trade["tp1_hit"] = True; trade["trail_active"] = True; trade["trail_peak"] = mid
         else:
-            if mid >= sl: await _close_trade(sym, "SL", mid, entry, trade["risk"]); return
-            if mid <= tp1:
+            if ask >= sl: await _close_trade(sym, "SL", ask, entry, trade["risk"]); return
+            if bid <= tp1:
                 trade["tp1_hit"] = True; trade["trail_active"] = True; trade["trail_peak"] = mid
         return
 
-    # After TP1: trail; original also has TP2
+    # After TP1: trailing (and TP2 in original)
     if side == "LONG":
         if trade["trail_active"]:
-            trade["trail_peak"] = max(trade["trail_peak"], mid)
-            trail_stop = trade["trail_peak"] - trail_dist
-            if mid <= trail_stop:
+            tp = trade.get("trail_peak")
+            tp = mid if tp is None else max(tp, mid)
+            trade["trail_peak"] = tp
+            trail_stop = tp - trail_dist
+            if bid <= trail_stop:
                 await _close_trade(sym, "TS", trail_stop, entry, trade["risk"]); return
-        if not S.CONSENSUS_ROUTER and tp2 and mid >= tp2:
+        if not S.CONSENSUS_ROUTER and tp2 and ask >= tp2:
             await _close_trade(sym, "TP2", tp2, entry, trade["risk"]); return
     else:
         if trade["trail_active"]:
-            trade["trail_peak"] = min(trade["trail_peak"], mid) if trade["trail_peak"] is not None else mid
-            trail_stop = trade["trail_peak"] + trail_dist
-            if mid >= trail_stop:
+            tp = trade.get("trail_peak")
+            tp = mid if tp is None else min(tp, mid)
+            trade["trail_peak"] = tp
+            trail_stop = tp + trail_dist
+            if ask >= trail_stop:
                 await _close_trade(sym, "TS", trail_stop, entry, trade["risk"]); return
-        if not S.CONSENSUS_ROUTER and tp2 and mid <= tp2:
+        if not S.CONSENSUS_ROUTER and tp2 and bid <= tp2:
             await _close_trade(sym, "TP2", tp2, entry, trade["risk"]); return
 
 async def on_aggtrade(symbol:str, data:dict):
@@ -1042,37 +1115,41 @@ async def _close_trade(symbol: str, outcome: str, exit_price: float, entry: floa
     trade = OPEN_TRADES.pop(symbol, None)
     if not trade: return
 
-    # Flatten on Binance (MARKET) and cancel leftovers
-    try:
-        if not S.DRY_RUN:
+    exchange_closed = True
+    close_err = None
+    if not S.DRY_RUN:
+        try:
             await force_close_market(symbol)
-    except Exception as e:
-        log.info("force_close_warn", symbol=symbol, error=str(e))
+            pos = await BINANCE_CLIENT.get_position_risk(symbol)
+            amt = 0.0 if not pos else float(pos.get("positionAmt", "0") or "0")
+            exchange_closed = (abs(amt) < 1e-12)
+            if not exchange_closed:
+                close_err = f"Position still open: {amt}"
+        except Exception as e:
+            exchange_closed = False
+            close_err = str(e)
 
-    # Stats & alert
     if risk <= 0: R = 0.0
     else:
         if outcome in ("TP2", "TS"):
             R = (exit_price - entry)/risk if trade["side"]=="LONG" else (entry - exit_price)/risk
-        else: R = -1.0
+        else:
+            R = -1.0
     stats_add_trade_result(symbol, R, outcome)
     pl_pct = _fmt_pct(exit_price, entry)
     dur_min = (int(time.time()) - trade["opened_ts"]) / 60.0
-    msg = (f"📌 <b>RESULT</b> {symbol}\n"
+    status_emoji = "✅" if exchange_closed or S.DRY_RUN else "⚠️"
+    extra = "" if exchange_closed or S.DRY_RUN else f"\nExchange close failed: {close_err}"
+
+    msg = (f"{status_emoji} <b>RESULT</b> {symbol}\n"
            f"Outcome: <b>{outcome}</b>\n"
            f"Entry: {entry:.6f} → Exit: {exit_price:.6f}  (PnL: {pl_pct:+.2f}% | {R:+.2f}R)\n"
            f"TP1 hit: {'✅' if trade.get('tp1_hit') else '—'}\n"
-           f"Duration: {dur_min:.1f} min")
+           f"Duration: {dur_min:.1f} min{extra}")
     await alert(msg, symbol)
-    _log_event({"ts": int(time.time()), "type": "result", "symbol": symbol, "outcome": outcome, "entry": entry, "exit": exit_price, "pnl_pct": pl_pct, "R": R, "tp1_hit": trade.get('tp1_hit')})
+    _log_event({"ts": int(time.time()), "type": "result", "symbol": symbol, "outcome": outcome, "entry": entry, "exit": exit_price, "pnl_pct": pl_pct, "R": R, "tp1_hit": trade.get('tp1_hit'), "exchange_closed": exchange_closed, "close_err": close_err})
 
 # ------------- Alerts & Main -------------
-async def alert(text:str, symbol:str) -> bool:
-    STATE["last_alert"]={"symbol":symbol,"text":text,"ts":int(time.time())}
-    tg=Telegram(S.TELEGRAM_BOT_TOKEN or "", S.TELEGRAM_CHAT_ID or "", REST_SESSION)
-    ok = await tg.send(text)
-    return ok
-
 async def start_http_server(state:dict):
     server = HealthServer(state); await server.start(S.HOST, S.PORT)
     log.info("http_started", host=S.HOST, port=S.PORT)
@@ -1080,21 +1157,24 @@ async def start_http_server(state:dict):
 async def small_backfill(client:"BinanceClient", sym:str, tf:str):
     data=await client.klines(sym, tf, limit=S.BACKFILL_LIMIT)
     for k in data[:-1]:
-        # REST kline fields: [0]t, [1]o,[2]h,[3]l,[4]c,[5]base vol,[6]T,[7]quote vol, ...
         o,h,l,c = float(k[1]),float(k[2]),float(k[3]),float(k[4])
-        q_quote = float(k[7]) if len(k)>7 else 0.0   # QUOTE vol
+        q_quote = float(k[7]) if len(k)>7 else 0.0
         BE.add_candle(sym, tf, Candle(int(k[0]), o, h, l, c, q_quote, int(k[6])))
 
 async def main():
     global REST_SESSION, BINANCE_CLIENT
     log.info("boot", tfs=S.TIMEFRAMES, rr="1:2", trailing_after_tp1=True, cooldown_after_trade_sec=S.COOLDOWN_AFTER_TRADE_SEC, consensus=S.CONSENSUS_ROUTER)
+
     asyncio.create_task(start_http_server(STATE))
     asyncio.create_task(daily_stats_loop())
 
     REST_SESSION = aiohttp.ClientSession()
     BINANCE_CLIENT = BinanceClient(REST_SESSION)
+    try:
+        await BINANCE_CLIENT.sync_time()
+    except Exception as e:
+        log.warning("time_sync_warn", error=str(e))
 
-    # Load exchange info (filters), then symbols
     try:
         await load_exchange_info(REST_SESSION)
     except Exception as e:
@@ -1108,14 +1188,12 @@ async def main():
         symbols=[str(S.SYMBOLS)]
     STATE["symbols"]=symbols
 
-    # Timeframes — if consensus router is ON, ensure "1m" is present internally
     tfs = list(S.TIMEFRAMES)
     if S.CONSENSUS_ROUTER and "1m" not in tfs:
         tfs = ["1m"] + tfs
     STATE["timeframes"]=tfs
     log.info("symbols_selected", count=len(symbols), tfs=tfs)
 
-    # Configure account per env
     try:
         await BINANCE_CLIENT.set_position_mode(dualSide = (S.POSITION_MODE.upper()=="HEDGE"))
     except Exception as e:
@@ -1130,14 +1208,12 @@ async def main():
         except Exception as e:
             log.info("leverage_info", symbol=sym, error=str(e))
 
-    # Backfill
     for i, sym in enumerate(symbols):
         for tf in tfs:
             try: await small_backfill(BINANCE_CLIENT, sym, tf)
             except Exception as e: log.warning("backfill_error", symbol=sym, tf=tf, error=str(e))
         if i % 10 == 0: await asyncio.sleep(0.2)
 
-    # Streams
     ws_multi=WSStreamMulti(symbols, tfs, on_kline, on_bookticker, on_aggtrade, on_depth, chunk_size=S.WS_CHUNK_SIZE)
     await ws_multi.run()
 
