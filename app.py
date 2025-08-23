@@ -1,4 +1,7 @@
-# app.py — Binance USDT-M Scalper (ENTER FIRST → then alert; uses actual fill prices)
+# app.py — Binance USDT-M Scalper
+# ENTER FIRST (MARKET) → poll fill → place SL/TP → alert
+# Uses actual exchange fills for entry/exit, and reports PnL **after fees**.
+
 import sys, subprocess, os
 def _ensure(pkgs):
     import importlib
@@ -60,11 +63,15 @@ class Settings(BaseSettings):
 
     ATR_LEN: int = 14
     ATR_SL_MULT: float = 1.5
-    ENTRY_MODE: str = "MARKET"
+    ENTRY_MODE: str = "MARKET"           # hard-locked
     MAX_RISK_PCT: float = 1.0
     ACCOUNT_EQUITY_USDT: Optional[float] = None
     DRY_RUN: bool = True
     TRAIL_ATR_MULT: float = 1.0
+
+    # Fees (bps) – adjust to your VIP level
+    FEE_TAKER_BPS: float = float(os.getenv("FEE_TAKER_BPS", "4.0"))   # 0.04%
+    FEE_MAKER_BPS: float = float(os.getenv("FEE_MAKER_BPS", "2.0"))   # 0.02%
 
     COOLDOWN_AFTER_TRADE_SEC: int = 14400
 
@@ -81,6 +88,7 @@ class Settings(BaseSettings):
     PORT: int = int(os.getenv("PORT", "8080"))
     TZ: str = "Asia/Riyadh"
 
+    # ---------- Consensus Router knobs (optional) ----------
     CONSENSUS_ROUTER: bool = False
     SPREAD_BPS_MAX: float = 8.0
     ATR1M_MIN_BPS: float = 5.0
@@ -103,10 +111,11 @@ class Settings(BaseSettings):
     DAILY_DD_HALT_PCT: float = 5.0
     TOXIC_IMB_THRESH: float = 0.70
 
+    # Private API
     BINANCE_API_KEY: Optional[str] = os.getenv("BINANCE_API_KEY")
     BINANCE_API_SECRET: Optional[str] = os.getenv("BINANCE_API_SECRET")
     MARGIN_TYPE: str = os.getenv("MARGIN_TYPE", "ISOLATED")
-    POSITION_MODE: str = os.getenv("POSITION_MODE", "ONE_WAY")
+    POSITION_MODE: str = os.getenv("POSITION_MODE", "ONE_WAY")  # ONE_WAY or HEDGE
     LEVERAGE: int = int(os.getenv("LEVERAGE", "5"))
     NOTIONAL_MAX_PCT: Optional[float] = float(os.getenv("NOTIONAL_MAX_PCT", "100"))
 
@@ -128,6 +137,7 @@ class Settings(BaseSettings):
 
 S = Settings()
 
+# ---------------- Logging ----------------
 def setup_logging(level: str = "INFO"):
     timestamper = structlog.processors.TimeStamper(fmt="iso", utc=True)
     structlog.configure(
@@ -146,6 +156,7 @@ def setup_logging(level: str = "INFO"):
 log = setup_logging(S.LOG_LEVEL)
 
 # ---------------- Utils/TA ----------------
+from typing import NamedTuple
 def now_utc() -> datetime: return datetime.now(timezone.utc)
 def to_tz(dt: datetime, tz: str) -> datetime: return dt.astimezone(ZoneInfo(tz))
 def riyadh_now() -> datetime: return to_tz(now_utc(), S.TZ)
@@ -314,8 +325,10 @@ class BinanceClient:
     async def get_position_risk(self, symbol: str):
         d = await self._signed("GET", "/fapi/v2/positionRisk", {"symbol": symbol})
         return d[0] if d else None
+    async def get_order(self, symbol: str, orderId: int | str):
+        return await self._signed("GET", "/fapi/v1/order", {"symbol": symbol, "orderId": orderId})
 
-# Streams
+# Streams per chunk
 class WSStream:
     def __init__(self, symbols: List[str], timeframes: List[str], on_kline, on_bookticker, on_aggtrade, on_depth):
         self.symbols=[s.lower() for s in symbols]; self.timeframes=timeframes
@@ -578,6 +591,7 @@ def stats_add_trade_result(symbol: str, R: float, outcome: str):
     elif outcome == "SL": st["losses_sl"] += 1; CONSEC_LOSSES += 1
     if st["best"] is None or R > st["best"][1]: st["best"] = (symbol, R)
     if st["worst"] is None or R < st["worst"][1]: st["worst"] = (symbol, R)
+
 def compose_daily_summary() -> str:
     key = local_day_key(); st = DAILY_STATS.get(key, {})
     if not st or st["count"] == 0: return f"📅 Daily Stats – {key}\nNo trades today."
@@ -590,6 +604,7 @@ def compose_daily_summary() -> str:
             f"Wins: {wins} (TP2 {st['wins_tp2']}, TS {st['wins_ts']}) | Losses: {losses}\n"
             f"Hit rate: {hit:.1f}% | Net: {st['sum_R']:+.2f}R | Avg: {avg_R:+.2f}R\n"
             f"Best: {best}   Worst: {worst}   Consecutive losses: {CONSEC_LOSSES}")
+
 def seconds_until_next_2200_riyadh() -> float:
     now = riyadh_now(); target = now.replace(hour=22, minute=0, second=0, microsecond=0)
     if now >= target: target = target + timedelta(days=1)
@@ -651,17 +666,14 @@ def _rsi_dir_conf(sym:str)->Tuple[Optional[str], float, Optional[float]]:
         val = (r - S.RSI_HIGH) / max(1.0, 80.0 - S.RSI_HIGH); conf = max(0.0, min(1.0, val))
         return "LONG", conf, r
     elif r <= S.RSI_LOW:
-        val = (S.RSI_LOW - r) / max(1.0, S.RSI_LOW - 20.0); conf = max(0.0, min(1.0, val))
+        val = (S.RSI_LOW - r) / max(1.0, S.SI_LOW - 20.0) if False else (S.RSI_LOW - r) / max(1.0, S.RSI_LOW - 20.0)
+        conf = max(0.0, min(1.0, val))
         return "SHORT", conf, r
     else:
         return None, 0.0, r
 
 # ----------- Execution helpers -----------
 def _parse_avg_price(order_resp: dict, fallback: float) -> float:
-    """
-    Try to derive actual fill price from Binance response.
-    Priority: avgPrice -> (cumQuote / executedQty) -> fills[] -> fallback
-    """
     try:
         ap = order_resp.get("avgPrice")
         if ap is not None and ap != "0":
@@ -686,6 +698,11 @@ def _parse_avg_price(order_resp: dict, fallback: float) -> float:
         pass
     return float(fallback)
 
+def _is_hedge() -> bool:
+    return (S.POSITION_MODE or "ONE_WAY").upper() == "HEDGE"
+def _pos_side(side: str) -> str:
+    return "LONG" if side == "LONG" else "SHORT"
+
 async def compute_qty(symbol: str, entry: float, sl: float) -> float:
     risk = abs(entry - sl)
     if risk <= 0: return 0.0
@@ -707,14 +724,9 @@ def _ord_status(phase, ok, msg=None):
     global LAST_ORDER
     LAST_ORDER = {"phase": phase, "ok": ok, "msg": (msg or "")[:300], "ts": int(time.time())}
 
-def _is_hedge() -> bool:
-    return (S.POSITION_MODE or "ONE_WAY").upper() == "HEDGE"
-def _pos_side(side: str) -> str:
-    return "LONG" if side == "LONG" else "SHORT"
-
 async def place_entry_and_brackets(sym: str, side: str, entry_price_ref: float, sl_price: float, tp_limit: Optional[float]):
     """
-    ENTER FIRST: MARKET (hard-locked) → SL STOP_MARKET → TP LIMIT reduceOnly.
+    ENTER FIRST: send MARKET, poll until filled, then place SL/TP (reduceOnly).
     Returns dict with order ids + qty + entryAvg. DRY_RUN returns placeholders.
     """
     if S.DRY_RUN:
@@ -722,77 +734,86 @@ async def place_entry_and_brackets(sym: str, side: str, entry_price_ref: float, 
 
     qty = await compute_qty(sym, entry_price_ref, sl_price)
     f = FILTERS.get(sym, {"minQty":0.0, "minNotional":0.0})
-    if qty <= 0 or qty < (f["minQty"] or 0.0):
-        raise RuntimeError(f"Computed quantity too small: {qty}")
+    est_notional = (entry_price_ref or 0.0) * (qty or 0.0)
+    if qty <= 0 or qty < (f["minQty"] or 0.0) or est_notional < (f["minNotional"] or 0.0):
+        raise RuntimeError(f"Qty/notional too small (qty={qty}, notional≈{est_notional}, minQty={f.get('minQty')}, minNotional={f.get('minNotional')})")
 
-    # ---------- ENTRY: ALWAYS MARKET ----------
+    # ENTRY: MARKET (always)
+    entry_kwargs = {}
+    if _is_hedge():
+        entry_kwargs["positionSide"] = _pos_side(side)
     try:
-        entry_kwargs = {}
-        if _is_hedge():
-            entry_kwargs["positionSide"] = _pos_side(side)
         entry_resp = await BINANCE_CLIENT.place_order(
-            sym,
-            "BUY" if side=="LONG" else "SELL",
-            "MARKET",
-            quantity=f"{qty:.10f}",
-            **entry_kwargs
+            sym, "BUY" if side=="LONG" else "SELL", "MARKET",
+            quantity=f"{qty:.10f}", **entry_kwargs
         )
-        _ord_status("ENTRY", True)
+        _ord_status("ENTRY_SEND", True)
     except Exception as e:
-        _ord_status("ENTRY", False, str(e))
-        raise
-    entry_id = entry_resp.get("orderId")
-    entry_avg = _parse_avg_price(entry_resp, entry_price_ref)
+        _ord_status("ENTRY_SEND", False, str(e)); raise
 
-    # SL: STOP_MARKET (closePosition in one-way; reduceOnly+positionSide in hedge)
+    order_id = entry_resp.get("orderId")
+    avg = _parse_avg_price(entry_resp, 0.0)
+    executed = float(entry_resp.get("executedQty", "0") or 0.0)
+
+    # POLL up to ~2s for real fill
+    for _ in range(20):
+        if avg > 0 and executed > 0:
+            break
+        await asyncio.sleep(0.1)
+        try:
+            q = await BINANCE_CLIENT.get_order(sym, order_id)
+            avg = _parse_avg_price(q, avg or 0.0)
+            executed = float(q.get("executedQty", "0") or 0.0)
+            status = (q.get("status") or "").upper()
+            if status in ("FILLED", "PARTIALLY_FILLED") and executed > 0 and avg > 0:
+                break
+            if status in ("CANCELED", "REJECTED", "EXPIRED"):
+                raise RuntimeError(f"Entry {status.lower()}: {q}")
+        except Exception as pe:
+            _ord_status("ENTRY_POLL_WARN", False, str(pe))
+
+    if executed <= 0 or avg <= 0:
+        try: await BINANCE_CLIENT.cancel_all(sym)
+        except Exception: pass
+        raise RuntimeError("Entry not filled (avg/executed still zero after polling)")
+
+    entry_avg = avg
+
+    # SL: STOP_MARKET
     sl_p, _ = quantize(sym, sl_price, None)
     try:
         sl_kwargs = {"workingType": S.SL_WORKING_TYPE}
-        if _is_hedge():
-            sl_kwargs.update({"reduceOnly": True, "positionSide": _pos_side(side)})
-        else:
-            sl_kwargs.update({"closePosition": True})
+        if _is_hedge(): sl_kwargs.update({"reduceOnly": True, "positionSide": _pos_side(side)})
+        else: sl_kwargs.update({"closePosition": True})
         sl_resp = await BINANCE_CLIENT.place_order(
-            sym,
-            "SELL" if side=="LONG" else "BUY",
-            "STOP_MARKET",
-            stopPrice=f"{(sl_p or sl_price):.10f}",
-            **sl_kwargs
+            sym, "SELL" if side=="LONG" else "BUY", "STOP_MARKET",
+            stopPrice=f"{(sl_p or sl_price):.10f}", **sl_kwargs
         )
         _ord_status("SL", True)
     except Exception as e:
-        _ord_status("SL", False, str(e))
-        raise
+        _ord_status("SL", False, str(e)); raise
     sl_id = sl_resp.get("orderId")
 
-    # TP: LIMIT reduceOnly (+ positionSide in hedge)
+    # TP: LIMIT reduceOnly
     tp_id = None
     if tp_limit is not None:
         tp_p, _ = quantize(sym, tp_limit, None)
         try:
             tp_kwargs = {"timeInForce":"GTC","quantity":f"{qty:.10f}","reduceOnly":True}
-            if _is_hedge():
-                tp_kwargs["positionSide"] = _pos_side(side)
+            if _is_hedge(): tp_kwargs["positionSide"] = _pos_side(side)
             tp_resp = await BINANCE_CLIENT.place_order(
-                sym,
-                "SELL" if side=="LONG" else "BUY",
-                "LIMIT",
-                price=f"{(tp_p or tp_limit):.10f}",
-                **tp_kwargs
+                sym, "SELL" if side=="LONG" else "BUY", "LIMIT",
+                price=f"{(tp_p or tp_limit):.10f}", **tp_kwargs
             )
             _ord_status("TP", True)
             tp_id = tp_resp.get("orderId")
         except Exception as e:
             _ord_status("TP", False, str(e))
-            raise
+            # proceed with SL only
 
-    return {"entryId": entry_id, "slId": sl_id, "tpId": tp_id, "qty": qty, "entryAvg": entry_avg}
+    return {"entryId": order_id, "slId": sl_id, "tpId": tp_id, "qty": executed, "entryAvg": entry_avg}
 
 async def force_close_market(sym: str, side_hint: Optional[str]=None) -> Optional[Tuple[dict, Optional[float]]]:
-    """
-    Try MARKET reduceOnly close. Return (resp, exit_avg_price) if success.
-    If fallback STOP_MARKET is used, exit_avg may be None (unknown until trigger).
-    """
     if S.DRY_RUN:
         return None
     pos = await BINANCE_CLIENT.get_position_risk(sym)
@@ -821,8 +842,7 @@ async def force_close_market(sym: str, side_hint: Optional[str]=None) -> Optiona
             exit_avg = _parse_avg_price(resp, 0.0) or None
             return resp, exit_avg
         except Exception as e:
-            last_err = str(e)
-            await asyncio.sleep(0.2 * (attempt + 1))
+            last_err = str(e); await asyncio.sleep(0.2 * (attempt + 1))
     try:
         top = OB.top(sym)
         ref = (top.bid_price if side == "SELL" else top.ask_price) if top else None
@@ -832,20 +852,26 @@ async def force_close_market(sym: str, side_hint: Optional[str]=None) -> Optiona
             kwargs.update({"reduceOnly": True, "positionSide": "LONG" if raw_amt > 0 else "SHORT"})
         else:
             kwargs["closePosition"] = True
-        resp = await BINANCE_CLIENT.place_order(
-            sym, side, "STOP_MARKET",
-            stopPrice=f"{(sp or ref or 0.0):.10f}", **kwargs
-        )
+        resp = await BINANCE_CLIENT.place_order(sym, side, "STOP_MARKET", stopPrice=f"{(sp or ref or 0.0):.10f}", **kwargs)
         return resp, None
     except Exception as e2:
         raise RuntimeError(f"force_close failed; market_err={last_err} stop_err={str(e2)}")
 
-async def place_entry_and_brackets_safe(sym, side, entry_price_ref, sl_price, tp_limit):
-    try:
-        out = await place_entry_and_brackets(sym, side, entry_price_ref, sl_price, tp_limit)
-        return out, None
-    except Exception as e:
-        return None, str(e)[:500]
+# ---------- PnL (after fees) ----------
+def pnl_after_fees(entry: float, exit_: float, side: str, risk: float, exit_fee_bps: float) -> Tuple[float,float]:
+    """
+    Returns (net_pct, net_R) after subtracting entry taker fee and exit fee (maker/taker).
+    net_pct is relative to entry price (signed).
+    """
+    if entry <= 0:
+        return 0.0, 0.0
+    fee_entry = entry * (S.FEE_TAKER_BPS/10_000.0)
+    fee_exit  = exit_ * (exit_fee_bps/10_000.0)
+    gross = (exit_ - entry) if side=="LONG" else (entry - exit_)
+    net = gross - (fee_entry + fee_exit)
+    net_pct = (net / entry) * 100.0
+    net_R = 0.0 if risk <= 0 else (net / risk)
+    return net_pct, net_R
 
 # ------------- Handlers -----------
 async def on_kline(symbol:str, k:dict):
@@ -860,6 +886,7 @@ async def on_kline(symbol:str, k:dict):
     sig=BE.on_closed_bar(sym, tf)
     if not sig: return
 
+    # HTF bias gate (5m vs 15m)
     if tf=="5m":
         buf=BE.buffers.get((sym,"15m"))
         if buf and len(buf["c"])>=S.HTF_SMA_LEN:
@@ -871,8 +898,8 @@ async def on_kline(symbol:str, k:dict):
                                (sig.side=="SHORT" and htf_close<htf_sma and htf_slope<0))
             if not sig.htf_bias_ok: return
 
-    buf=BE.buffers.get((sym,tf))
-    vol_z = 0.0
+    # Volume Z
+    buf=BE.buffers.get((sym,tf)); vol_z=0.0
     if buf and len(buf["v"])>=30:
         vols=list(buf["v"]); win=vols[-30:-1]
         if win:
@@ -894,6 +921,7 @@ async def on_kline(symbol:str, k:dict):
         ref = sig.level * (1+S.BREAKOUT_PAD_BP/10_000) if sig.side=="LONG" else sig.level*(1-S.BREAKOUT_PAD_BP/10_000)
         if DEP.has_opposite_wall(sym, sig.side, ref, S.WALL_BAND_BP, S.WALL_MULT): return
 
+    # Cooldown / duplicate
     now_ts = int(time.time())
     if now_ts - LAST_TRADE_TS.get(sym, 0) < S.COOLDOWN_AFTER_TRADE_SEC: return
     if sym in OPEN_TRADES: return
@@ -905,6 +933,7 @@ async def on_kline(symbol:str, k:dict):
     atr_val = sig.atr_val if sig.atr_val and sig.atr_val>0 else (sig.price*0.003)
     pad = S.BREAKOUT_PAD_BP / 10_000
 
+    # -------- Consensus Router path --------
     if S.CONSENSUS_ROUTER:
         sp = _spread_bps(sym)
         if sp is None or sp > S.SPREAD_BPS_MAX: return
@@ -920,12 +949,14 @@ async def on_kline(symbol:str, k:dict):
         tp1   = from_bps(S.TP1_BPS, entry, sig.side, +1 if sig.side=="LONG" else -1)
         a1    = _atr1m_bps(sym) or 10.0
         trail_dist = (a1/10_000.0) * mid * S.TRAIL_ATR1M_MULT
-        risk  = abs(entry - sl)
 
-        orders, err = await place_entry_and_brackets_safe(sym=sym, side=sig.side, entry_price_ref=entry, sl_price=sl, tp_limit=tp1)
-        if err:
-            await alert(f"🚫 ORDER FAILED (Router) {sym} {tf}\n{sig.side} entry≈{entry:.6f} SL≈{sl:.6f} TP1≈{tp1:.6f}\nErr: {err}", sym)
-            return
+        orders = None; err = None
+        try:
+            orders = await place_entry_and_brackets(sym=sym, side=sig.side, entry_price_ref=entry, sl_price=sl, tp_limit=tp1)
+        except Exception as e:
+            err = str(e)
+        if err or not orders:
+            await alert(f"🚫 ORDER FAILED (Router) {sym} {tf}\n{sig.side} entry≈{entry:.6f} SL≈{sl:.6f} TP1≈{tp1:.6f}\nErr: {err}", sym); return
 
         actual_entry = orders.get("entryAvg", entry)
         OPEN_TRADES[sym] = {
@@ -947,15 +978,20 @@ async def on_kline(symbol:str, k:dict):
         _log_event({"ts": now_ts, "type": "signal_consensus", "symbol": sym, "side": sig.side, "entry": actual_entry, "sl": sl, "tp1": tp1})
         return
 
+    # -------- Original R:R=1:2 path --------
     entry = sig.price
     sl    = entry - atr_val * S.ATR_SL_MULT if sig.side=="LONG" else entry + atr_val * S.ATR_SL_MULT
-    tp1   = entry + abs(entry - sl) if sig.side=="LONG" else entry - abs(entry - sl)
-    tp2   = entry + 2*abs(entry - sl) if sig.side=="LONG" else entry - 2*abs(entry - sl)
+    risk  = abs(entry - sl)
+    tp1   = entry + risk if sig.side=="LONG" else entry - risk
+    tp2   = entry + 2*risk if sig.side=="LONG" else entry - 2*risk
 
-    orders, err = await place_entry_and_brackets_safe(sym=sym, side=sig.side, entry_price_ref=entry, sl_price=sl, tp_limit=tp2)
-    if err:
-        await alert(f"🚫 ORDER FAILED {sym} {tf}\n{sig.side} entry≈{entry:.6f} SL≈{sl:.6f} TP2≈{tp2:.6f}\nErr: {err}", sym)
-        return
+    orders = None; err = None
+    try:
+        orders = await place_entry_and_brackets(sym=sym, side=sig.side, entry_price_ref=entry, sl_price=sl, tp_limit=tp2)
+    except Exception as e:
+        err = str(e)
+    if err or not orders:
+        await alert(f"🚫 ORDER FAILED {sym} {tf}\n{sig.side} entry≈{entry:.6f} SL≈{sl:.6f} TP2≈{tp2:.6f}\nErr: {err}", sym); return
 
     actual_entry = orders.get("entryAvg", entry)
     risk = abs(actual_entry - sl)
@@ -964,8 +1000,7 @@ async def on_kline(symbol:str, k:dict):
         "entry": actual_entry, "sl": sl, "tp1": tp1, "tp2": tp2,
         "risk": risk, "opened_ts": now_ts,
         "tp1_hit": False, "trail_active": False, "trail_peak": None,
-        "trail_dist": (sig.atr_val if sig.atr_val else entry*0.003) * S.TRAIL_ATR_MULT,
-        "atr_at_entry": sig.atr_val if sig.atr_val else entry*0.003,
+        "trail_dist": atr_val * S.TRAIL_ATR_MULT, "atr_at_entry": atr_val,
         "time_stop": None, "order_ids": orders
     }
     LAST_TRADE_TS[sym] = now_ts
@@ -992,6 +1027,7 @@ async def on_bookticker(symbol:str, data:dict):
     entry = trade["entry"]; sl = trade["sl"]; tp1 = trade["tp1"]; tp2 = trade["tp2"]
     trail_dist = trade["trail_dist"]
 
+    # router time stop
     if S.CONSENSUS_ROUTER and trade.get("time_stop") and int(time.time()) >= trade["time_stop"] and not trade["tp1_hit"]:
         await _close_trade(sym, "TS", mid, entry, trade["risk"]); return
 
@@ -1046,7 +1082,7 @@ async def _close_trade(symbol: str, outcome: str, exit_price: float, entry: floa
     trade = OPEN_TRADES.pop(symbol, None)
     if not trade: return
 
-    # Try to flatten on Binance and take the exchange average price for accuracy
+    # Exchange flatten – try MARKET and take its avg fill
     exchange_closed = True
     close_err = None
     actual_exit = exit_price
@@ -1066,14 +1102,12 @@ async def _close_trade(symbol: str, outcome: str, exit_price: float, entry: floa
             exchange_closed = False
             close_err = str(e)
 
-    # Use actual_exit for PnL/R
-    if risk <= 0: R = 0.0
-    else:
-        if outcome in ("TP2", "TS"):
-            R = (actual_exit - entry)/risk if trade["side"]=="LONG" else (entry - actual_exit)/risk
-        else:
-            R = -1.0
-    pl_pct = _fmt_pct(actual_exit, entry)
+    # Exit fee bps (TP2=maker, TS/SL=taker)
+    exit_fee_bps = S.FEE_MAKER_BPS if outcome == "TP2" else S.FEE_TAKER_BPS
+    net_pct, net_R = pnl_after_fees(entry, actual_exit, trade["side"], risk, exit_fee_bps)
+    pl_pct = net_pct
+    R = net_R
+
     dur_min = (int(time.time()) - trade["opened_ts"]) / 60.0
     status_emoji = "✅" if exchange_closed or S.DRY_RUN else "⚠️"
     extra = "" if exchange_closed or S.DRY_RUN else f"\nExchange close failed: {close_err}"
@@ -1081,11 +1115,12 @@ async def _close_trade(symbol: str, outcome: str, exit_price: float, entry: floa
     stats_add_trade_result(symbol, R, outcome)
     msg = (f"{status_emoji} <b>RESULT</b> {symbol}\n"
            f"Outcome: <b>{outcome}</b>\n"
-           f"Entry: {entry:.6f} → Exit: {actual_exit:.6f}  (PnL: {pl_pct:+.2f}% | {R:+.2f}R)\n"
+           f"Entry: {entry:.6f} → Exit: {actual_exit:.6f}  (PnL net: {pl_pct:+.2f}% | {R:+.2f}R)\n"
            f"TP1 hit: {'✅' if trade.get('tp1_hit') else '—'}\n"
+           f"Fees (bps): taker {S.FEE_TAKER_BPS:.2f}, maker {S.FEE_MAKER_BPS:.2f}\n"
            f"Duration: {dur_min:.1f} min{extra}")
     await alert(msg, symbol)
-    _log_event({"ts": int(time.time()), "type": "result", "symbol": symbol, "outcome": outcome, "entry": entry, "exit": actual_exit, "pnl_pct": pl_pct, "R": R, "tp1_hit": trade.get('tp1_hit'), "exchange_closed": exchange_closed, "close_err": close_err})
+    _log_event({"ts": int(time.time()), "type": "result", "symbol": symbol, "outcome": outcome, "entry": entry, "exit": actual_exit, "pnl_pct_net": pl_pct, "R_net": R, "tp1_hit": trade.get('tp1_hit'), "exchange_closed": exchange_closed, "close_err": close_err})
 
 # ------------- Alerts & Main -------------
 async def start_http_server(state:dict):
@@ -1117,6 +1152,7 @@ async def main():
     except Exception as e:
         log.warning("exchange_info_warn", error=str(e))
 
+    # Symbols
     if S.SYMBOLS=="ALL" or (isinstance(S.SYMBOLS,str) and S.SYMBOLS.upper()=="ALL"):
         symbols=await discover_perp_usdt_symbols(REST_SESSION, S.MAX_SYMBOLS)
     elif isinstance(S.SYMBOLS, (list, tuple)):
@@ -1125,12 +1161,14 @@ async def main():
         symbols=[str(S.SYMBOLS)]
     STATE["symbols"]=symbols
 
+    # Timeframes — if consensus router is ON, ensure "1m" is present internally
     tfs = list(S.TIMEFRAMES)
     if S.CONSENSUS_ROUTER and "1m" not in tfs:
         tfs = ["1m"] + tfs
     STATE["timeframes"]=tfs
     log.info("symbols_selected", count=len(symbols), tfs=tfs)
 
+    # Configure account per env
     try:
         await BINANCE_CLIENT.set_position_mode(dualSide = (S.POSITION_MODE.upper()=="HEDGE"))
     except Exception as e:
@@ -1145,12 +1183,14 @@ async def main():
         except Exception as e:
             log.info("leverage_info", symbol=sym, error=str(e))
 
+    # Backfill
     for i, sym in enumerate(symbols):
         for tf in tfs:
             try: await small_backfill(BINANCE_CLIENT, sym, tf)
             except Exception as e: log.warning("backfill_error", symbol=sym, tf=tf, error=str(e))
         if i % 10 == 0: await asyncio.sleep(0.2)
 
+    # Streams
     ws_multi=WSStreamMulti(symbols, tfs, on_kline, on_bookticker, on_aggtrade, on_depth, chunk_size=S.WS_CHUNK_SIZE)
     await ws_multi.run()
 
