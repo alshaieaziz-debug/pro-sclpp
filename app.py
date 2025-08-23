@@ -1,18 +1,4 @@
-# app.py — Binance USDT-M Scalper (ENTER FIRST → then alert; robust orders/closes)
-# ✅ Signals: Breakout + body, Quick Retest, Sweep/Reclaim, HTF(15m) bias gating 5m
-# ✅ Flow: CVD slope, Liquidity wall avoidance, Quote-volume Z
-# ✅ OI: relaxed z/Δ% with last-step slope
-# ✅ Risk: R:R=1:2 (TP1, TP2), TRAIL only after TP1 (orig). Router uses TP1 + trail.
-# ✅ Ops: 4h cooldown, Daily stats (22:00 Riyadh), /healthz, Telegram
-# ✅ Fixes:
-#    - ENTER first → place SL/TP → then send EXECUTED (or FAILED).
-#    - DRY_RUN: alerts always; exchange calls only when False.
-#    - Telegram: per-send session + retry; last_telegram in /healthz.
-#    - Binance: time sync + recvWindow; precision quantizer (tick/step/mins).
-#    - SL: STOP_MARKET closePosition (no reduceOnly). TP: LIMIT reduceOnly qty.
-#    - Trailing: peak init + bid/ask checks + None guards.
-#    - force_close: quantized qty + retry + STOP_MARKET fallback; verify flat.
-
+# app.py — Binance USDT-M Scalper (ENTER FIRST → then alert; uses actual fill prices)
 import sys, subprocess, os
 def _ensure(pkgs):
     import importlib
@@ -41,13 +27,12 @@ from pydantic import field_validator
 
 # ---------------- Settings ----------------
 class Settings(BaseSettings):
-    SYMBOLS: str | List[str] = "ALL"      # "ALL" or CSV like "BTCUSDT,ETHUSDT"
+    SYMBOLS: str | List[str] = "ALL"
     TIMEFRAMES: List[str] = ["5m","15m"]
     MAX_SYMBOLS: int = 200
     WS_CHUNK_SIZE: int = 60
     BACKFILL_LIMIT: int = 60
 
-    # Breakout & confirmations
     BREAKOUT_PAD_BP: int = 10
     BODY_RATIO_MIN: float = 0.60
     RETEST_BARS: int = 2
@@ -58,26 +43,21 @@ class Settings(BaseSettings):
     HTF_SMA_LEN: int = 50
     WICK_SIDE_MAX: float = 0.40
 
-    # Volume (Z-score on QUOTE)
     VOL_Z_MIN: float = 1.5
 
-    # OI (eased)
     OI_LOOKBACK: str = "5m"
     OI_Z_MIN: float = 1.0
     OI_DELTA_MIN: float = 0.005
 
-    # CVD (aggTrade)
     ENABLE_CVD: bool = True
     CVD_WINDOW_SEC: int = 300
     CVD_REQUIRE_SIGN: bool = True
     CVD_MIN_SLOPE_ABS: float = 0.0001
 
-    # Liquidity walls (depth5)
     ENABLE_WALLS: bool = True
     WALL_BAND_BP: int = 15
     WALL_MULT: float = 2.5
 
-    # Risk (R:R = 1:2)
     ATR_LEN: int = 14
     ATR_SL_MULT: float = 1.5
     ENTRY_MODE: str = "MARKET"
@@ -86,27 +66,21 @@ class Settings(BaseSettings):
     DRY_RUN: bool = True
     TRAIL_ATR_MULT: float = 1.0
 
-    # Cooldown AFTER trade open
-    COOLDOWN_AFTER_TRADE_SEC: int = 14400  # 4h
+    COOLDOWN_AFTER_TRADE_SEC: int = 14400
 
-    # Diagnostics
     TRACE_DECISIONS: bool = True
     TRACE_SAMPLE: float = 0.15
 
-    # Ops
     LOG_LEVEL: str = "INFO"
     DATA_DIR: str = "./data"
 
-    # Telegram
     TELEGRAM_BOT_TOKEN: Optional[str] = None
     TELEGRAM_CHAT_ID: Optional[str] = None
 
-    # Server
     HOST: str = "0.0.0.0"
     PORT: int = int(os.getenv("PORT", "8080"))
     TZ: str = "Asia/Riyadh"
 
-    # ---------- Consensus Router knobs (optional) ----------
     CONSENSUS_ROUTER: bool = False
     SPREAD_BPS_MAX: float = 8.0
     ATR1M_MIN_BPS: float = 5.0
@@ -129,7 +103,6 @@ class Settings(BaseSettings):
     DAILY_DD_HALT_PCT: float = 5.0
     TOXIC_IMB_THRESH: float = 0.70
 
-    # Private API
     BINANCE_API_KEY: Optional[str] = os.getenv("BINANCE_API_KEY")
     BINANCE_API_SECRET: Optional[str] = os.getenv("BINANCE_API_SECRET")
     MARGIN_TYPE: str = os.getenv("MARGIN_TYPE", "ISOLATED")
@@ -137,7 +110,6 @@ class Settings(BaseSettings):
     LEVERAGE: int = int(os.getenv("LEVERAGE", "5"))
     NOTIONAL_MAX_PCT: Optional[float] = float(os.getenv("NOTIONAL_MAX_PCT", "100"))
 
-    # Stops workingType
     SL_WORKING_TYPE: Literal["CONTRACT_PRICE","MARK_PRICE"] = "MARK_PRICE"
 
     model_config = SettingsConfigDict(env_file=".env", case_sensitive=False)
@@ -224,8 +196,7 @@ BASE_WS   = "wss://fstream.binance.com/stream"
 REST_SESSION: Optional[aiohttp.ClientSession] = None
 BINANCE_CLIENT = None
 
-# Symbol filters for precision
-FILTERS: Dict[str, Dict[str, float]] = {}  # symbol -> {tickSize, stepSize, minQty, minNotional}
+FILTERS: Dict[str, Dict[str, float]] = {}
 
 def _to_float(x, default=0.0):
     try: return float(x)
@@ -288,13 +259,11 @@ class BinanceClient:
         self.key = S.BINANCE_API_KEY
         self.secret = (S.BINANCE_API_SECRET or "").encode()
         self.time_offset_ms = 0
-
     async def sync_time(self):
         async with self.session.get(f"{BASE_REST}/fapi/v1/time") as r:
             r.raise_for_status()
             srv = await r.json()
         self.time_offset_ms = int(srv["serverTime"]) - int(time.time()*1000)
-
     async def _signed(self, method: str, path: str, params: Dict[str, Any] | None = None):
         if params is None: params = {}
         if abs(self.time_offset_ms) > 5000:
@@ -310,8 +279,6 @@ class BinanceClient:
             if r.status != 200:
                 raise RuntimeError(f"Binance {method} {path} {r.status}: {txt}")
             return orjson.loads(txt)
-
-    # Public-ish
     async def klines(self, symbol:str, interval:str, limit:int=200):
         p={"symbol":symbol.upper(),"interval":interval,"limit":limit}
         async with self.session.get(f"{BASE_REST}/fapi/v1/klines", params=p) as r:
@@ -328,16 +295,12 @@ class BinanceClient:
             if r.status!=200: return None
             d=await r.json()
             return float(d.get("openInterest", 0))
-
-    # Private config
     async def set_margin_type(self, symbol: str, mtype: str):
         return await self._signed("POST", "/fapi/v1/marginType", {"symbol": symbol, "marginType": mtype})
     async def set_leverage(self, symbol: str, leverage: int):
         return await self._signed("POST", "/fapi/v1/leverage", {"symbol": symbol, "leverage": leverage})
     async def set_position_mode(self, dualSide: bool):
         return await self._signed("POST", "/fapi/v1/positionSide/dual", {"dualSidePosition": "true" if dualSide else "false"})
-
-    # Orders & account
     async def place_order(self, symbol: str, side: str, type_: str, **kwargs):
         return await self._signed("POST", "/fapi/v1/order", {"symbol": symbol, "side": side, "type": type_, **kwargs})
     async def cancel_all(self, symbol: str):
@@ -350,9 +313,9 @@ class BinanceClient:
         return None
     async def get_position_risk(self, symbol: str):
         d = await self._signed("GET", "/fapi/v2/positionRisk", {"symbol": symbol})
-        return d[0] if d else None  # one-way mode returns single dict
+        return d[0] if d else None
 
-# Streams per chunk: kline(1m/5m/15m) + bookTicker + aggTrade + depth5
+# Streams
 class WSStream:
     def __init__(self, symbols: List[str], timeframes: List[str], on_kline, on_bookticker, on_aggtrade, on_depth):
         self.symbols=[s.lower() for s in symbols]; self.timeframes=timeframes
@@ -362,9 +325,7 @@ class WSStream:
         parts=[]
         for s in self.symbols:
             for tf in self.timeframes: parts.append(f"{s}@kline_{tf}")
-            parts.append(f"{s}@bookTicker")
-            parts.append(f"{s}@aggTrade")
-            parts.append(f"{s}@depth5@100ms")
+            parts.append(f"{s}@bookTicker"); parts.append(f"{s}@aggTrade"); parts.append(f"{s}@depth5@100ms")
         return f"{BASE_WS}?streams={'/'.join(parts)}"
     async def run(self):
         url=self._streams()
@@ -377,8 +338,6 @@ class WSStream:
                         elif "bookTicker" in stream: await self.on_bookticker(data["s"], data)
                         elif "aggTrade" in stream: await self.on_aggtrade(data["s"], data)
                         elif "depth5" in stream: await self.on_depth(data["s"], data)
-                    elif msg.type==aiohttp.WSMsgType.ERROR:
-                        break
 
 class WSStreamMulti:
     def __init__(self, all_symbols: List[str], timeframes: List[str], on_kline, on_bookticker, on_aggtrade, on_depth, chunk_size:int):
@@ -397,7 +356,6 @@ class OrderBookTracker:
     def top(self, sym:str)->Optional[BookTop]: return self.tops.get(sym.upper())
 
 class CVDTracker:
-    """CVD from aggTrade: buyer_is_maker means sell-side aggressor (negative)."""
     def __init__(self, window_sec:int=300):
         self.window_sec=window_sec
         self.buff:Dict[str,Deque[Tuple[float,float]]] = defaultdict(lambda: deque())
@@ -416,7 +374,6 @@ class CVDTracker:
         return total / max(span, 1e-6)
 
 class DepthTracker:
-    """Detect opposite walls near breakout band using per-side snapshot medians."""
     def __init__(self):
         self.last_depth: Dict[str, Dict[str, List[Tuple[float,float]]]] = {}
     def on_depth5(self, sym:str, data:dict):
@@ -558,7 +515,7 @@ async def alert(text:str, symbol:str) -> bool:
     tg = Telegram(S.TELEGRAM_BOT_TOKEN or "", S.TELEGRAM_CHAT_ID or "")
     return await tg.send(text)
 
-# ------------- Diagnostics (drop reasons) -------------
+# ------------- Diagnostics / HTTP -------------
 TRACE_DECISIONS = S.TRACE_DECISIONS
 TRACE_SAMPLE = float(S.TRACE_SAMPLE)
 REASONS = defaultdict(int)
@@ -570,7 +527,6 @@ def _maybe_debug_drop(symbol: str, tf: str, reason: str, ctx: dict):
     if TRACE_DECISIONS and random.random() < TRACE_SAMPLE:
         log.info("drop_reason", symbol=symbol, tf=tf, reason=reason, **ctx_slim)
 
-# ------------- HTTP server -------------
 class HealthServer:
     def __init__(self, state:dict):
         self.app=web.Application(); self.state=state
@@ -595,7 +551,6 @@ class HealthServer:
             "recent_drops": list(LAST_DROPS),
         })
 
-# ------------- Stats & helpers -------------
 def local_day_key(dt: Optional[datetime]=None) -> str:
     d = riyadh_now() if dt is None else to_tz(dt, S.TZ)
     return d.strftime("%Y-%m-%d")
@@ -623,7 +578,6 @@ def stats_add_trade_result(symbol: str, R: float, outcome: str):
     elif outcome == "SL": st["losses_sl"] += 1; CONSEC_LOSSES += 1
     if st["best"] is None or R > st["best"][1]: st["best"] = (symbol, R)
     if st["worst"] is None or R < st["worst"][1]: st["worst"] = (symbol, R)
-
 def compose_daily_summary() -> str:
     key = local_day_key(); st = DAILY_STATS.get(key, {})
     if not st or st["count"] == 0: return f"📅 Daily Stats – {key}\nNo trades today."
@@ -636,7 +590,6 @@ def compose_daily_summary() -> str:
             f"Wins: {wins} (TP2 {st['wins_tp2']}, TS {st['wins_ts']}) | Losses: {losses}\n"
             f"Hit rate: {hit:.1f}% | Net: {st['sum_R']:+.2f}R | Avg: {avg_R:+.2f}R\n"
             f"Best: {best}   Worst: {worst}   Consecutive losses: {CONSEC_LOSSES}")
-
 def seconds_until_next_2200_riyadh() -> float:
     now = riyadh_now(); target = now.replace(hour=22, minute=0, second=0, microsecond=0)
     if now >= target: target = target + timedelta(days=1)
@@ -702,20 +655,37 @@ def _rsi_dir_conf(sym:str)->Tuple[Optional[str], float, Optional[float]]:
         return "SHORT", conf, r
     else:
         return None, 0.0, r
-def _pmm_imbalance(sym:str)->Optional[float]:
-    top = OB.top(sym)
-    if not top: return None
-    den = (top.bid_qty + top.ask_qty)
-    if den <= 0: return None
-    return float(top.bid_qty / den)
-def _grid_aligned(price: float, step_bp: float, side: str) -> bool:
-    if step_bp <= 0: return False
-    step = step_bp/10_000.0
-    grid = round(price / (price*step)) * (price*step)
-    dist = abs(price - grid)
-    return (dist <= price*step*0.15)
 
 # ----------- Execution helpers -----------
+def _parse_avg_price(order_resp: dict, fallback: float) -> float:
+    """
+    Try to derive actual fill price from Binance response.
+    Priority: avgPrice -> (cumQuote / executedQty) -> fills[] -> fallback
+    """
+    try:
+        ap = order_resp.get("avgPrice")
+        if ap is not None and ap != "0":
+            return float(ap)
+    except Exception:
+        pass
+    try:
+        cum_quote = float(order_resp.get("cumQuote", "0") or 0.0)
+        executed = float(order_resp.get("executedQty", "0") or 0.0)
+        if executed > 0 and cum_quote > 0:
+            return cum_quote / executed
+    except Exception:
+        pass
+    try:
+        fills = order_resp.get("fills") or []
+        if fills:
+            num = sum(float(f["price"]) * float(f.get("qty", f.get("commissionAsset", 0)) or 0.0) for f in fills)
+            den = sum(float(f.get("qty", 0.0)) for f in fills)
+            if den > 0:
+                return num / den
+    except Exception:
+        pass
+    return float(fallback)
+
 async def compute_qty(symbol: str, entry: float, sl: float) -> float:
     risk = abs(entry - sl)
     if risk <= 0: return 0.0
@@ -737,39 +707,57 @@ def _ord_status(phase, ok, msg=None):
     global LAST_ORDER
     LAST_ORDER = {"phase": phase, "ok": ok, "msg": (msg or "")[:300], "ts": int(time.time())}
 
+def _is_hedge() -> bool:
+    return (S.POSITION_MODE or "ONE_WAY").upper() == "HEDGE"
+def _pos_side(side: str) -> str:
+    return "LONG" if side == "LONG" else "SHORT"
+
 async def place_entry_and_brackets(sym: str, side: str, entry_price_ref: float, sl_price: float, tp_limit: Optional[float]):
     """
-    ENTER FIRST: MARKET → SL STOP_MARKET closePosition → TP LIMIT reduceOnly.
-    Returns dict with order ids + qty. DRY_RUN returns placeholders.
+    ENTER FIRST: MARKET (hard-locked) → SL STOP_MARKET → TP LIMIT reduceOnly.
+    Returns dict with order ids + qty + entryAvg. DRY_RUN returns placeholders.
     """
     if S.DRY_RUN:
-        return {"entryId": None, "slId": None, "tpId": None, "qty": 0.0}
+        return {"entryId": None, "slId": None, "tpId": None, "qty": 0.0, "entryAvg": entry_price_ref}
 
     qty = await compute_qty(sym, entry_price_ref, sl_price)
     f = FILTERS.get(sym, {"minQty":0.0, "minNotional":0.0})
     if qty <= 0 or qty < (f["minQty"] or 0.0):
         raise RuntimeError(f"Computed quantity too small: {qty}")
 
-    # ENTRY: MARKET
+    # ---------- ENTRY: ALWAYS MARKET ----------
     try:
+        entry_kwargs = {}
+        if _is_hedge():
+            entry_kwargs["positionSide"] = _pos_side(side)
         entry_resp = await BINANCE_CLIENT.place_order(
-            sym, "BUY" if side=="LONG" else "SELL", "MARKET",
-            quantity=f"{qty:.10f}"
+            sym,
+            "BUY" if side=="LONG" else "SELL",
+            "MARKET",
+            quantity=f"{qty:.10f}",
+            **entry_kwargs
         )
         _ord_status("ENTRY", True)
     except Exception as e:
         _ord_status("ENTRY", False, str(e))
         raise
     entry_id = entry_resp.get("orderId")
+    entry_avg = _parse_avg_price(entry_resp, entry_price_ref)
 
-    # SL: STOP_MARKET closePosition (robust)
+    # SL: STOP_MARKET (closePosition in one-way; reduceOnly+positionSide in hedge)
     sl_p, _ = quantize(sym, sl_price, None)
     try:
+        sl_kwargs = {"workingType": S.SL_WORKING_TYPE}
+        if _is_hedge():
+            sl_kwargs.update({"reduceOnly": True, "positionSide": _pos_side(side)})
+        else:
+            sl_kwargs.update({"closePosition": True})
         sl_resp = await BINANCE_CLIENT.place_order(
-            sym, "SELL" if side=="LONG" else "BUY", "STOP_MARKET",
+            sym,
+            "SELL" if side=="LONG" else "BUY",
+            "STOP_MARKET",
             stopPrice=f"{(sl_p or sl_price):.10f}",
-            workingType=S.SL_WORKING_TYPE,
-            closePosition=True
+            **sl_kwargs
         )
         _ord_status("SL", True)
     except Exception as e:
@@ -777,15 +765,20 @@ async def place_entry_and_brackets(sym: str, side: str, entry_price_ref: float, 
         raise
     sl_id = sl_resp.get("orderId")
 
-    # TP: LIMIT reduceOnly with qty
+    # TP: LIMIT reduceOnly (+ positionSide in hedge)
     tp_id = None
     if tp_limit is not None:
         tp_p, _ = quantize(sym, tp_limit, None)
         try:
+            tp_kwargs = {"timeInForce":"GTC","quantity":f"{qty:.10f}","reduceOnly":True}
+            if _is_hedge():
+                tp_kwargs["positionSide"] = _pos_side(side)
             tp_resp = await BINANCE_CLIENT.place_order(
-                sym, "SELL" if side=="LONG" else "BUY", "LIMIT",
-                price=f"{(tp_p or tp_limit):.10f}", timeInForce="GTC",
-                quantity=f"{qty:.10f}", reduceOnly=True
+                sym,
+                "SELL" if side=="LONG" else "BUY",
+                "LIMIT",
+                price=f"{(tp_p or tp_limit):.10f}",
+                **tp_kwargs
             )
             _ord_status("TP", True)
             tp_id = tp_resp.get("orderId")
@@ -793,58 +786,57 @@ async def place_entry_and_brackets(sym: str, side: str, entry_price_ref: float, 
             _ord_status("TP", False, str(e))
             raise
 
-    return {"entryId": entry_id, "slId": sl_id, "tpId": tp_id, "qty": qty}
+    return {"entryId": entry_id, "slId": sl_id, "tpId": tp_id, "qty": qty, "entryAvg": entry_avg}
 
-async def force_close_market(sym: str) -> Optional[dict]:
+async def force_close_market(sym: str, side_hint: Optional[str]=None) -> Optional[Tuple[dict, Optional[float]]]:
     """
-    Market-flat the position. Robust:
-      - quantizes qty to stepSize
-      - retries MARKET reduceOnly
-      - fallback STOP_MARKET closePosition on MARK_PRICE
+    Try MARKET reduceOnly close. Return (resp, exit_avg_price) if success.
+    If fallback STOP_MARKET is used, exit_avg may be None (unknown until trigger).
     """
     if S.DRY_RUN:
         return None
-
     pos = await BINANCE_CLIENT.get_position_risk(sym)
     if not pos:
         try: await BINANCE_CLIENT.cancel_all(sym)
         except Exception: pass
         return None
-
     raw_amt = float(pos.get("positionAmt", "0") or "0")
     if abs(raw_amt) < 1e-12:
         try: await BINANCE_CLIENT.cancel_all(sym)
         except Exception: pass
         return None
-
     side = "SELL" if raw_amt > 0 else "BUY"
+    if side_hint and side_hint in ("BUY","SELL"):
+        side = side_hint
     step = (FILTERS.get(sym, {}) or {}).get("stepSize", 0.001) or 0.001
     q = math.floor(abs(raw_amt) / step) * step
     if q <= 0: q = step
-
     last_err = None
     for attempt in range(3):
         try:
-            resp = await BINANCE_CLIENT.place_order(
-                sym, side, "MARKET", quantity=f"{q:.10f}", reduceOnly=True
-            )
-            return resp
+            kwargs = {"reduceOnly": True}
+            if _is_hedge():
+                kwargs["positionSide"] = "LONG" if raw_amt > 0 else "SHORT"
+            resp = await BINANCE_CLIENT.place_order(sym, side, "MARKET", quantity=f"{q:.10f}", **kwargs)
+            exit_avg = _parse_avg_price(resp, 0.0) or None
+            return resp, exit_avg
         except Exception as e:
             last_err = str(e)
             await asyncio.sleep(0.2 * (attempt + 1))
-
-    # Fallback STOP_MARKET closePosition on MARK_PRICE
     try:
         top = OB.top(sym)
         ref = (top.bid_price if side == "SELL" else top.ask_price) if top else None
         sp, _ = quantize(sym, ref or 0.0, None)
+        kwargs = {"workingType":"MARK_PRICE"}
+        if _is_hedge():
+            kwargs.update({"reduceOnly": True, "positionSide": "LONG" if raw_amt > 0 else "SHORT"})
+        else:
+            kwargs["closePosition"] = True
         resp = await BINANCE_CLIENT.place_order(
             sym, side, "STOP_MARKET",
-            stopPrice=f"{(sp or ref or 0.0):.10f}",
-            workingType="MARK_PRICE",
-            closePosition=True
+            stopPrice=f"{(sp or ref or 0.0):.10f}", **kwargs
         )
-        return resp
+        return resp, None
     except Exception as e2:
         raise RuntimeError(f"force_close failed; market_err={last_err} stop_err={str(e2)}")
 
@@ -866,11 +858,8 @@ async def on_kline(symbol:str, k:dict):
     STATE["last_kline"]={"symbol":sym,"tf":tf,"t":k["T"]}
 
     sig=BE.on_closed_bar(sym, tf)
-    if not sig:
-        _maybe_debug_drop(sym, tf, "no_candidate", {"close": cndl.close})
-        return
+    if not sig: return
 
-    # HTF bias (15m) for 5m
     if tf=="5m":
         buf=BE.buffers.get((sym,"15m"))
         if buf and len(buf["c"])>=S.HTF_SMA_LEN:
@@ -880,13 +869,8 @@ async def on_kline(symbol:str, k:dict):
             htf_slope = htf_close - htf_closes[-S.HTF_SMA_LEN]
             sig.htf_bias_ok = ((sig.side=="LONG"  and htf_close>htf_sma and htf_slope>0) or
                                (sig.side=="SHORT" and htf_close<htf_sma and htf_slope<0))
-            if not sig.htf_bias_ok:
-                _maybe_debug_drop(sym, tf, "htf_bias_block", {"htf_close": round(htf_close,6), "htf_sma": round(htf_sma or 0.0,6), "slope": round(htf_slope,6), "side": sig.side})
-                return
-        else:
-            sig.htf_bias_ok=True
+            if not sig.htf_bias_ok: return
 
-    # Volume Z-score
     buf=BE.buffers.get((sym,tf))
     vol_z = 0.0
     if buf and len(buf["v"])>=30:
@@ -894,45 +878,26 @@ async def on_kline(symbol:str, k:dict):
         if win:
             mean=sum(win)/len(win); var=sum((x-mean)**2 for x in win)/len(win); std=math.sqrt(var) if var>0 else 1.0
             vol_z=(vols[-1]-mean)/std
-    if vol_z < S.VOL_Z_MIN:
-        _maybe_debug_drop(sym, tf, "vol_z_low", {"vol_z": round(vol_z,3), "min": S.VOL_Z_MIN})
-        return
+    if vol_z < S.VOL_Z_MIN: return
 
-    # OI check
-    if not await fetch_oi_relaxed_ok(sym, sig.side):
-        _maybe_debug_drop(sym, tf, "oi_block", {"side": sig.side})
-        return
+    if not await fetch_oi_relaxed_ok(sym, sig.side): return
 
-    # CVD sign
     if S.ENABLE_CVD and CVD:
         slope = CVD.slope(sym)
         if S.CVD_REQUIRE_SIGN:
-            if sig.side=="LONG" and slope <= S.CVD_MIN_SLOPE_ABS:
-                _maybe_debug_drop(sym, tf, "cvd_block", {"slope": round(slope,6), "need": f">{S.CVD_MIN_SLOPE_ABS}"})
-                return
-            if sig.side=="SHORT" and slope >= -S.CVD_MIN_SLOPE_ABS:
-                _maybe_debug_drop(sym, tf, "cvd_block", {"slope": round(slope,6), "need": f"<{-S.CVD_MIN_SLOPE_ABS}"})
-                return
+            if sig.side=="LONG" and slope <= S.CVD_MIN_SLOPE_ABS: return
+            if sig.side=="SHORT" and slope >= -S.CVD_MIN_SLOPE_ABS: return
     else:
         slope = 0.0
 
-    # Liquidity walls
     if S.ENABLE_WALLS and DEP:
         ref = sig.level * (1+S.BREAKOUT_PAD_BP/10_000) if sig.side=="LONG" else sig.level*(1-S.BREAKOUT_PAD_BP/10_000)
-        if DEP.has_opposite_wall(sym, sig.side, ref, S.WALL_BAND_BP, S.WALL_MULT):
-            _maybe_debug_drop(sym, tf, "wall_block", {"ref": round(ref,6), "band_bp": S.WALL_BAND_BP, "mult": S.WALL_MULT})
-            return
+        if DEP.has_opposite_wall(sym, sig.side, ref, S.WALL_BAND_BP, S.WALL_MULT): return
 
-    # Cooldown / duplicate
     now_ts = int(time.time())
-    if now_ts - LAST_TRADE_TS.get(sym, 0) < S.COOLDOWN_AFTER_TRADE_SEC:
-        _maybe_debug_drop(sym, tf, "cooldown", {"cooldown_sec": S.COOLDOWN_AFTER_TRADE_SEC})
-        return
-    if sym in OPEN_TRADES:
-        _maybe_debug_drop(sym, tf, "already_open", {})
-        return
+    if now_ts - LAST_TRADE_TS.get(sym, 0) < S.COOLDOWN_AFTER_TRADE_SEC: return
+    if sym in OPEN_TRADES: return
 
-    # ---------- Build plan ----------
     top = OB.top(sym)
     bid = top.bid_price if top else sig.price
     ask = top.ask_price if top else sig.price
@@ -940,27 +905,15 @@ async def on_kline(symbol:str, k:dict):
     atr_val = sig.atr_val if sig.atr_val and sig.atr_val>0 else (sig.price*0.003)
     pad = S.BREAKOUT_PAD_BP / 10_000
 
-    # ------------- Consensus Router -------------
     if S.CONSENSUS_ROUTER:
         sp = _spread_bps(sym)
-        if sp is None or sp > S.SPREAD_BPS_MAX:
-            _maybe_debug_drop(sym, tf, "spread_gate", {"spread_bps": round(sp or -1,2), "max": S.SPREAD_BPS_MAX})
-            return
+        if sp is None or sp > S.SPREAD_BPS_MAX: return
         a1 = _atr1m_bps(sym)
-        if a1 is None or a1 < S.ATR1M_MIN_BPS or a1 > S.ATR1M_MAX_BPS:
-            _maybe_debug_drop(sym, tf, "atr1m_gate", {"atr1m_bps": round(a1 or -1,2), "min": S.ATR1M_MIN_BPS, "max": S.ATR1M_MAX_BPS})
-            return
-        if OB.top(sym) is None or DEP.last_depth.get(sym) is None:
-            _maybe_debug_drop(sym, tf, "data_gate", {})
-            return
+        if a1 is None or a1 < S.ATR1M_MIN_BPS or a1 > S.ATR1M_MAX_BPS: return
         rsi_dir, rsi_conf, rsi_val = _rsi_dir_conf(sym)
-        if rsi_dir is None or rsi_dir != sig.side:
-            _maybe_debug_drop(sym, tf, "rsi_disagree", {"side": sig.side, "rsi_dir": rsi_dir, "rsi": rsi_val})
-            return
+        if rsi_dir is None or rsi_dir != sig.side: return
         br_conf = max(0.0, min(1.0, (sig.body_ratio - S.BODY_RATIO_MIN) / max(1e-6, 1.0 - S.BODY_RATIO_MIN)))
-        if rsi_conf < S.CONS_MIN or br_conf < S.CONS_MIN:
-            _maybe_debug_drop(sym, tf, "conf_low", {"rsi_conf": round(rsi_conf,2), "br_conf": round(br_conf,2), "min": S.CONS_MIN})
-            return
+        if rsi_conf < S.CONS_MIN or br_conf < S.CONS_MIN: return
 
         entry = sig.level * (1 + pad) if sig.side=="LONG" else sig.level * (1 - pad)
         sl    = from_bps(S.SL_BPS, entry, sig.side, -1 if sig.side=="LONG" else +1)
@@ -969,77 +922,60 @@ async def on_kline(symbol:str, k:dict):
         trail_dist = (a1/10_000.0) * mid * S.TRAIL_ATR1M_MULT
         risk  = abs(entry - sl)
 
-        # ENTER FIRST
-        orders, err = await place_entry_and_brackets_safe(sym=sym, side=sig.side,
-                                                          entry_price_ref=entry, sl_price=sl, tp_limit=tp1)
+        orders, err = await place_entry_and_brackets_safe(sym=sym, side=sig.side, entry_price_ref=entry, sl_price=sl, tp_limit=tp1)
         if err:
-            await alert(
-                f"🚫 ORDER FAILED (Router) {sym} {tf}\n"
-                f"{sig.side} entry≈{entry:.6f} SL≈{sl:.6f} TP1≈{tp1:.6f}\nErr: {err}", sym)
+            await alert(f"🚫 ORDER FAILED (Router) {sym} {tf}\n{sig.side} entry≈{entry:.6f} SL≈{sl:.6f} TP1≈{tp1:.6f}\nErr: {err}", sym)
             return
 
+        actual_entry = orders.get("entryAvg", entry)
         OPEN_TRADES[sym] = {
             "symbol": sym, "side": sig.side, "tf": tf,
-            "entry": entry, "sl": sl, "tp1": tp1, "tp2": None,
-            "risk": risk, "opened_ts": now_ts,
+            "entry": actual_entry, "sl": sl, "tp1": tp1, "tp2": None,
+            "risk": abs(actual_entry - sl),
+            "opened_ts": now_ts,
             "tp1_hit": False, "trail_active": True, "trail_peak": mid,
             "trail_dist": trail_dist, "atr_at_entry": atr_val,
             "time_stop": now_ts + int(min(max(S.TIME_STOP_SEC_MIN, 240), S.TIME_STOP_SEC_MAX)),
             "order_ids": orders
         }
         LAST_TRADE_TS[sym] = now_ts
-
         qty_txt = f"{orders.get('qty',0):.4f}" if not S.DRY_RUN else "—"
         await alert(
-            f"🛒 EXECUTED (Router) {sym} {tf}\n"
-            f"Entry: <b>{entry:.6f}</b> | SL: <b>{sl:.6f}</b> | TP1: <b>{tp1:.6f}</b>\n"
-            f"Qty: {qty_txt}\n"
-            f"VolZ: {vol_z:.2f}  CVD: {slope:.4f}  HTF:{'✅' if sig.htf_bias_ok else '❌'} Sweep:{'✅' if sig.sweep_reclaim else '—'}",
+            f"🛒 EXECUTED (Router) {sym} {tf}\nEntry: <b>{actual_entry:.6f}</b> | SL: <b>{sl:.6f}</b> | TP1: <b>{tp1:.6f}</b>\nQty: {qty_txt}\nVolZ: {vol_z:.2f}",
             sym
         )
-        _log_event({"ts": now_ts, "type": "signal_consensus", "symbol": sym, "side": sig.side, "entry": entry, "sl": sl, "tp1": tp1})
+        _log_event({"ts": now_ts, "type": "signal_consensus", "symbol": sym, "side": sig.side, "entry": actual_entry, "sl": sl, "tp1": tp1})
         return
 
-    # ------------- Original (R:R = 1:2) -------------
     entry = sig.price
     sl    = entry - atr_val * S.ATR_SL_MULT if sig.side=="LONG" else entry + atr_val * S.ATR_SL_MULT
-    risk  = abs(entry - sl)
-    if risk <= 0: 
-        _maybe_debug_drop(sym, tf, "zero_risk", {}); return
-    tp1   = entry + risk if sig.side=="LONG" else entry - risk
-    tp2   = entry + 2*risk if sig.side=="LONG" else entry - 2*risk
+    tp1   = entry + abs(entry - sl) if sig.side=="LONG" else entry - abs(entry - sl)
+    tp2   = entry + 2*abs(entry - sl) if sig.side=="LONG" else entry - 2*abs(entry - sl)
 
-    # ENTER FIRST
-    orders, err = await place_entry_and_brackets_safe(sym=sym, side=sig.side,
-                                                      entry_price_ref=entry, sl_price=sl, tp_limit=tp2)
+    orders, err = await place_entry_and_brackets_safe(sym=sym, side=sig.side, entry_price_ref=entry, sl_price=sl, tp_limit=tp2)
     if err:
-        await alert(
-            f"🚫 ORDER FAILED {sym} {tf}\n"
-            f"{sig.side} entry≈{entry:.6f} SL≈{sl:.6f} TP2≈{tp2:.6f}\nErr: {err}", sym)
+        await alert(f"🚫 ORDER FAILED {sym} {tf}\n{sig.side} entry≈{entry:.6f} SL≈{sl:.6f} TP2≈{tp2:.6f}\nErr: {err}", sym)
         return
 
+    actual_entry = orders.get("entryAvg", entry)
+    risk = abs(actual_entry - sl)
     OPEN_TRADES[sym] = {
         "symbol": sym, "side": sig.side, "tf": tf,
-        "entry": entry, "sl": sl, "tp1": tp1, "tp2": tp2,
+        "entry": actual_entry, "sl": sl, "tp1": tp1, "tp2": tp2,
         "risk": risk, "opened_ts": now_ts,
         "tp1_hit": False, "trail_active": False, "trail_peak": None,
-        "trail_dist": atr_val * S.TRAIL_ATR_MULT, "atr_at_entry": atr_val,
-        "time_stop": None,
-        "order_ids": orders
+        "trail_dist": (sig.atr_val if sig.atr_val else entry*0.003) * S.TRAIL_ATR_MULT,
+        "atr_at_entry": sig.atr_val if sig.atr_val else entry*0.003,
+        "time_stop": None, "order_ids": orders
     }
     LAST_TRADE_TS[sym] = now_ts
-
-    sl_pct=_fmt_pct(sl, entry); tp1_pct=_fmt_pct(tp1, entry); tp2_pct=_fmt_pct(tp2, entry)
+    sl_pct=_fmt_pct(sl, actual_entry); tp1_pct=_fmt_pct(tp1, actual_entry); tp2_pct=_fmt_pct(tp2, actual_entry)
     qty_txt = f"{orders.get('qty',0):.4f}" if not S.DRY_RUN else "—"
     await alert(
-        f"🛒 EXECUTED {sym} {tf}\n"
-        f"Entry: <b>{entry:.6f}</b>\n"
-        f"SL: <b>{sl:.6f}</b> ({sl_pct:+.2f}%) | TP1: <b>{tp1:.6f}</b> ({tp1_pct:+.2f}%) | TP2: <b>{tp2:.6f}</b> ({tp2_pct:+.2f}%)\n"
-        f"Qty: {qty_txt}\n"
-        f"VolZ: {vol_z:.2f}  CVD: {slope:.4f}  HTF:{'✅' if sig.htf_bias_ok else '❌'} Sweep:{'✅' if sig.sweep_reclaim else '—'}",
+        f"🛒 EXECUTED {sym} {tf}\nEntry: <b>{actual_entry:.6f}</b>\nSL: <b>{sl:.6f}</b> ({sl_pct:+.2f}%) | TP1: <b>{tp1:.6f}</b> ({tp1_pct:+.2f}%) | TP2: <b>{tp2:.6f}</b> ({tp2_pct:+.2f}%)\nQty: {qty_txt}",
         sym
     )
-    _log_event({"ts": now_ts, "type": "signal", "symbol": sym, "side": sig.side, "entry": entry, "sl": sl, "tp1": tp1, "tp2": tp2})
+    _log_event({"ts": now_ts, "type": "signal", "symbol": sym, "side": sig.side, "entry": actual_entry, "sl": sl, "tp1": tp1, "tp2": tp2})
 
 async def on_bookticker(symbol:str, data:dict):
     OB.update_book_ticker(symbol, data)
@@ -1056,11 +992,9 @@ async def on_bookticker(symbol:str, data:dict):
     entry = trade["entry"]; sl = trade["sl"]; tp1 = trade["tp1"]; tp2 = trade["tp2"]
     trail_dist = trade["trail_dist"]
 
-    # Time stop (router mode) before TP1
     if S.CONSENSUS_ROUTER and trade.get("time_stop") and int(time.time()) >= trade["time_stop"] and not trade["tp1_hit"]:
         await _close_trade(sym, "TS", mid, entry, trade["risk"]); return
 
-    # Before TP1: SL/TP1 checks
     if not trade["tp1_hit"]:
         if side == "LONG":
             if bid <= sl: await _close_trade(sym, "SL", bid, entry, trade["risk"]); return
@@ -1072,11 +1006,9 @@ async def on_bookticker(symbol:str, data:dict):
                 trade["tp1_hit"] = True; trade["trail_active"] = True; trade["trail_peak"] = mid
         return
 
-    # After TP1: trailing (and TP2 in original)
     if side == "LONG":
         if trade["trail_active"]:
-            tp = trade.get("trail_peak")
-            tp = mid if tp is None else max(tp, mid)
+            tp = trade.get("trail_peak"); tp = mid if tp is None else max(tp, mid)
             trade["trail_peak"] = tp
             trail_stop = tp - trail_dist
             if bid <= trail_stop:
@@ -1085,8 +1017,7 @@ async def on_bookticker(symbol:str, data:dict):
             await _close_trade(sym, "TP2", tp2, entry, trade["risk"]); return
     else:
         if trade["trail_active"]:
-            tp = trade.get("trail_peak")
-            tp = mid if tp is None else min(tp, mid)
+            tp = trade.get("trail_peak"); tp = mid if tp is None else min(tp, mid)
             trade["trail_peak"] = tp
             trail_stop = tp + trail_dist
             if ask >= trail_stop:
@@ -1115,11 +1046,17 @@ async def _close_trade(symbol: str, outcome: str, exit_price: float, entry: floa
     trade = OPEN_TRADES.pop(symbol, None)
     if not trade: return
 
+    # Try to flatten on Binance and take the exchange average price for accuracy
     exchange_closed = True
     close_err = None
+    actual_exit = exit_price
     if not S.DRY_RUN:
         try:
-            await force_close_market(symbol)
+            resp = await force_close_market(symbol)
+            if isinstance(resp, tuple) and resp:
+                _, exit_avg = resp
+                if exit_avg:
+                    actual_exit = exit_avg
             pos = await BINANCE_CLIENT.get_position_risk(symbol)
             amt = 0.0 if not pos else float(pos.get("positionAmt", "0") or "0")
             exchange_closed = (abs(amt) < 1e-12)
@@ -1129,25 +1066,26 @@ async def _close_trade(symbol: str, outcome: str, exit_price: float, entry: floa
             exchange_closed = False
             close_err = str(e)
 
+    # Use actual_exit for PnL/R
     if risk <= 0: R = 0.0
     else:
         if outcome in ("TP2", "TS"):
-            R = (exit_price - entry)/risk if trade["side"]=="LONG" else (entry - exit_price)/risk
+            R = (actual_exit - entry)/risk if trade["side"]=="LONG" else (entry - actual_exit)/risk
         else:
             R = -1.0
-    stats_add_trade_result(symbol, R, outcome)
-    pl_pct = _fmt_pct(exit_price, entry)
+    pl_pct = _fmt_pct(actual_exit, entry)
     dur_min = (int(time.time()) - trade["opened_ts"]) / 60.0
     status_emoji = "✅" if exchange_closed or S.DRY_RUN else "⚠️"
     extra = "" if exchange_closed or S.DRY_RUN else f"\nExchange close failed: {close_err}"
 
+    stats_add_trade_result(symbol, R, outcome)
     msg = (f"{status_emoji} <b>RESULT</b> {symbol}\n"
            f"Outcome: <b>{outcome}</b>\n"
-           f"Entry: {entry:.6f} → Exit: {exit_price:.6f}  (PnL: {pl_pct:+.2f}% | {R:+.2f}R)\n"
+           f"Entry: {entry:.6f} → Exit: {actual_exit:.6f}  (PnL: {pl_pct:+.2f}% | {R:+.2f}R)\n"
            f"TP1 hit: {'✅' if trade.get('tp1_hit') else '—'}\n"
            f"Duration: {dur_min:.1f} min{extra}")
     await alert(msg, symbol)
-    _log_event({"ts": int(time.time()), "type": "result", "symbol": symbol, "outcome": outcome, "entry": entry, "exit": exit_price, "pnl_pct": pl_pct, "R": R, "tp1_hit": trade.get('tp1_hit'), "exchange_closed": exchange_closed, "close_err": close_err})
+    _log_event({"ts": int(time.time()), "type": "result", "symbol": symbol, "outcome": outcome, "entry": entry, "exit": actual_exit, "pnl_pct": pl_pct, "R": R, "tp1_hit": trade.get('tp1_hit'), "exchange_closed": exchange_closed, "close_err": close_err})
 
 # ------------- Alerts & Main -------------
 async def start_http_server(state:dict):
@@ -1174,7 +1112,6 @@ async def main():
         await BINANCE_CLIENT.sync_time()
     except Exception as e:
         log.warning("time_sync_warn", error=str(e))
-
     try:
         await load_exchange_info(REST_SESSION)
     except Exception as e:
